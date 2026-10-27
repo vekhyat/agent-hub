@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-hub"
+version = "0.1.0"
+description = "Drive interactive coding agents in visible Foot terminals"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = ["pyte==0.8.2", "wcwidth==0.9.4", "tomlkit==0.15.2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
+
+[project.scripts]
+agent-hub = "agent_hub:cli"
+
+[project.urls]
+Repository = "https://github.com/vekhyat/agent-hub"
+Issues = "https://github.com/vekhyat/agent-hub/issues"
+
+[tool.setuptools]
+py-modules = ["agent_hub"]
+
+[tool.setuptools.data-files]
+"share/agent-hub/skill" = ["skill/SKILL.md"]

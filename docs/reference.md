@@ -68,7 +68,8 @@ Each spawn saves a small record under
 account, from any conversation. The record keeps the helper's family and the
 account directory it ran with: its profile's `home`, or the `CODEX_HOME` or
 `CLAUDE_CONFIG_DIR` it inherited. Editing or removing the profile, or resuming
-from another environment, does not change that account. The profile's current
+from another environment, does not change that account. Records saved before
+this behavior have no account directory and use the resuming caller's. The profile's current
 command is used while the profile exists with the same family; otherwise the
 family's default command is. It accepts `--model`, `--effort`, `--no-window`,
 and `--keep`. If a new helper reuses a closed helper's name, the old record stays

@@ -1682,7 +1682,8 @@ def save_record(record: dict) -> None:
 
 def codex_session_id(record: dict) -> str:
     """Find the rollout whose user message holds this helper's report ID; its name ends in the session ID."""
-    root = os.path.join(record.get("home") or CODEX_HOMES["codex"], "sessions")
+    home = record.get("home", "")  # "" (older records) inherits the caller's; None launches on Codex's default
+    root = os.path.join(os.path.expanduser(home or (CODEX_HOMES["codex"] if home == "" else "~/.codex")), "sessions")
     for path in glob.glob(os.path.join(root, "*/*/*/rollout-*.jsonl")):
         if os.path.getmtime(path) < record["started"] - 60:
             continue

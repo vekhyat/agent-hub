@@ -222,6 +222,29 @@ class ProfileChecks(unittest.TestCase):
                     sent = self.launched(hub.resume_agent, "legacy", visible=False)
                 self.assertEqual(sent["argv"][:3], ["/bin/codex-current", "resume", session])
                 self.assertEqual((sent["profile"], sent["env"]["CODEX_HOME"]), ("codex", caller))
+        current = self.root / "current"
+        self.config.write_text(f'[profiles.claude]\ncommand="claude-now"\nhome="{current}"\n')
+        hub.save_record({"name": "old-claude", "kind": "claude", "session_id": "the-id", "report_id": "r2",
+                         "cwd": self.temp.name, "model": "", "effort": "", "started": 0, "task": "t"})
+        sent = self.launched(hub.resume_agent, "old-claude", visible=False)
+        self.assertEqual(sent["argv"][:3], ["/bin/claude-now", "--resume", "the-id"])
+        self.assertEqual(sent["env"]["CLAUDE_CONFIG_DIR"], str(current))
+        hub.save_record({"name": "old-codex1", "kind": "codex1", "session_id": "the-id", "report_id": "r3",
+                         "cwd": self.temp.name, "model": "", "effort": "", "started": 0, "task": "t"})
+        with self.assertRaisesRegex(ValueError, "unknown profile 'codex1'"):
+            self.launched(hub.resume_agent, "old-codex1", visible=False)
+
+    def test_codex_record_on_the_native_default_is_found_and_launched_there(self):
+        caller, native = self.root / "caller", self.root / "native"
+        self.rollout(caller, "r4")  # a decoy: the caller's account must not be searched
+        record = {"name": "n", "report_id": "r4", "started": 0, "home": None}
+        real = os.path.expanduser
+        with patch.dict(hub.CODEX_HOMES, codex=str(caller)), \
+             patch.object(hub.os.path, "expanduser", lambda p: str(native) if p == "~/.codex" else real(p)):
+            with self.assertRaisesRegex(ValueError, "codex resume"):
+                hub.codex_session_id(record)
+            session = self.rollout(native, "r4")
+            self.assertEqual(hub.codex_session_id(record), session)
 
     def test_profile_settings_restore_leaves_other_account_untouched(self):
         first = self.root / "first.json"

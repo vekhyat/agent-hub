@@ -26,9 +26,11 @@ executables and cannot be launched by the hub.
    Replace each `home` with the directory its launcher selects. The hub sets
    `CODEX_HOME` to it and reads `models_cache.json` there for `agent-hub models`.
    A launcher that unconditionally sets a different directory overrides the hub,
-   so keep the two consistent. Always set `home`: without it, `resume` and
-   `agent-hub models` look in `~/.codex` for that account's sessions. Alternatively, drop the launchers and use profiles
-   with only `kind` and `home`.
+   so keep the two consistent. Always set `home`: without it, `resume` looks
+   for that account's sessions in the `CODEX_HOME` the helper inherited, or
+   `~/.codex`, and `agent-hub models` in `${CODEX_HOME:-~/.codex}`.
+   Alternatively, drop the launchers and use profiles with only `kind` and
+   `home`.
 
 2. Check the profiles and their model caches.
 

@@ -2,6 +2,7 @@
 import contextlib
 import json
 import os
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -146,6 +147,21 @@ class ProfileChecks(unittest.TestCase):
             hub.switch_model("running-helper", "haiku", "")
         restore.assert_called_once_with("claude", "haiku", "", path=original_settings)
         command.assert_called_once_with("running-helper", "/model haiku")
+
+
+    def test_spawn_keep_reaches_the_daemon(self):
+        captured = {}
+        def request(op, **args):
+            if op == "reports":
+                return {"reports": []}
+            captured.update(args)
+            return {"name": args["name"], "profile": args.get("profile"), "workspace": ""}
+        argv = ["agent-hub", "spawn", "claude", "helper", "task", "--cwd", self.temp.name, "--no-window", "--keep"]
+        with patch.object(hub, "request", request), patch.object(hub, "wait_ready", return_value="READY"), \
+             patch.object(hub.shutil, "which", return_value="/bin/claude"), patch.object(sys, "argv", argv), \
+             patch("builtins.print"):
+            hub.main()
+        self.assertTrue(captured["keep"])
 
 
 if __name__ == "__main__":

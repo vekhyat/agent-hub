@@ -1907,7 +1907,7 @@ def kill_agent(name: str) -> str:
 def main():
     # Viewers stay alive; keep CLI-parser and asyncio imports out of them.
     global OWNER
-    if len(sys.argv) == 3 and sys.argv[1] == "attach":
+    if len(sys.argv) == 3 and sys.argv[1] == "attach" and sys.argv[2] not in ("-h", "--help"):
         OWNER = json.loads(os.environ["AGENT_HUB_VIEW_OWNER"]) if "AGENT_HUB_VIEW_OWNER" in os.environ else caller_owner()
         run_attach(sys.argv[2])
         return
@@ -1976,7 +1976,7 @@ def main():
         return
     if a.command == "spawn":
         result = spawn_agent(a.kind, a.name, a.cwd, a.prompt, a.model, a.effort,
-                             visible=not a.no_window, terminal=a.terminal)
+                             visible=not a.no_window, terminal=a.terminal, keep=a.keep)
     elif a.command == "resume":
         result = resume_agent(a.name, a.prompt, a.model, a.effort, visible=not a.no_window, keep=a.keep)
     elif a.command == "turn-end":

@@ -432,7 +432,7 @@ def setup(skills: bool = True) -> tuple[str, bool]:
             os.makedirs(directory, exist_ok=True)
             os.symlink(source, target)
             lines.append(f"ok   skill linked: {target}")
-    lines.append("ready: try  agent-hub spawn claude helper 'Reply READY' --cwd \"$PWD\"" if ready else
+    lines.append(f"ready: try  agent-hub spawn {found[0]} helper 'Reply READY' --cwd \"$PWD\"" if ready else
                  "not ready: fix the MISS lines above, then run agent-hub setup again")
     return "\n".join(lines), ready
 

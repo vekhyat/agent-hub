@@ -275,7 +275,11 @@ HELPER_BRIEF = ("\n\n[agent-hub] REQUIRED: another agent gave you this task and 
                 "`{hub} tell {id} \"<message>\"` and end your turn; the reply arrives as your next message. "
                 "Your final action, even for a trivial task, must be running `{hub} done {id} \"<your full answer>\"`")
 # Absolute, because helpers run it from shells that may not share the caller's PATH.
-HUB_ARGV = ([shutil.which("agent-hub")] if shutil.which("agent-hub")
+# An installed module uses the console script beside its interpreter; a checkout runs itself.
+# Either way it is this copy, not whichever agent-hub comes first on PATH.
+_HUB_SCRIPT = shutil.which("agent-hub", path=os.path.dirname(sys.executable))
+_INSTALLED = os.path.realpath(__file__).startswith(os.path.realpath(sys.prefix) + os.sep)
+HUB_ARGV = ([os.path.abspath(_HUB_SCRIPT)] if _HUB_SCRIPT and _INSTALLED
             else [sys.executable, os.path.abspath(__file__)])
 HUB_COMMAND = shlex.join(HUB_ARGV)
 BUSY_SCAN_LINES = 10  # only the status area: an old marker higher in scrollback must not count
@@ -1600,8 +1604,11 @@ def available_models(kind: str) -> str:
                 "efforts: low, medium, high, xhigh, max")
     if kind in CODEX_HOMES:
         home = profile["home"] or CODEX_HOMES.get(name, CODEX_HOMES["codex"])
-        with open(os.path.join(home, "models_cache.json")) as f:
-            models = json.load(f)["models"]
+        try:
+            with open(os.path.join(home, "models_cache.json")) as f:
+                models = json.load(f)["models"]
+        except FileNotFoundError:
+            raise ValueError(f"no Codex model list in {home}; start codex once with this account to create it") from None
         return "\n".join(
             f"{m['slug']}  efforts: {', '.join(r['effort'] for r in m.get('supported_reasoning_levels', []))}"
             for m in models if m.get("visibility") == "list"
@@ -1681,8 +1688,11 @@ def codex_session_id(record: dict) -> str:
             continue
         with open(path, errors="replace") as f:
             for line in f:
-                if record["report_id"] in line and json.loads(line).get("payload", {}).get("role") == "user":
-                    return path[-len("00000000-0000-0000-0000-000000000000.jsonl"):-len(".jsonl")]
+                if record["report_id"] not in line:
+                    continue
+                with contextlib.suppress(ValueError):  # a line Codex is still writing
+                    if json.loads(line).get("payload", {}).get("role") == "user":
+                        return path[-len("00000000-0000-0000-0000-000000000000.jsonl"):-len(".jsonl")]
     raise ValueError(f"cannot find {record['name']!r} in Codex's saved sessions; use `codex resume` to pick it by hand")
 
 
@@ -1759,7 +1769,7 @@ def spawn_agent(
         env["CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"] = profile["home"]
     env["PATH"] = os.pathsep.join(dict.fromkeys([
         *os.get_exec_path(env), os.path.join(HOME, ".local/bin"),
-        os.path.join(HOME, ".local/share/mise/command-wrappers/bin"),
+        os.path.join(HOME, ".local/share/mise/command-wrappers/bin"),  # mise-installed agent CLIs
         os.path.join(HOME, ".opencode/bin"), "/usr/bin",
     ]))
     env.update(TERM="xterm-256color", COLORTERM="truecolor", PWD=cwd,
@@ -1809,7 +1819,7 @@ def resume_agent(name: str, prompt: str = "", model: str = "", effort: str = "",
     record = load_record(name)
     record["session_id"] = record["session_id"] or codex_session_id(record)
     return spawn_agent(record.get("profile", record["kind"]), name, record["cwd"], prompt, model or record["model"],
-                       effort or record["effort"], visible, keep, resume=record)
+                       effort or record["effort"], visible=visible, keep=keep, resume=record)
 
 
 def send_agent(name: str, text: str, submit: bool = True) -> str:
@@ -1893,7 +1903,7 @@ def turn_end(report_id: str, payload: str = "") -> str:
             return ""
         text = event.get("last_assistant_message") or event.get("last-assistant-message") or ""
         request("turn_end", id=report_id, text=text[:MAX_REPORT])
-    except (RuntimeError, ValueError, AttributeError):
+    except (RuntimeError, ValueError, AttributeError, OSError):
         pass
     return ""
 

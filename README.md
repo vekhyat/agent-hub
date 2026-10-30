@@ -191,6 +191,10 @@ ln -s "$PWD/skill" "$HOME/.codex/skills/agent-hub"
 ln -s "$PWD/skill" "$HOME/.claude/skills/agent-hub"
 ```
 
+Installing the package also places a copy at `<prefix>/share/agent-hub/skill/`
+(for `uv tool install`, inside the tool's environment), so you can link that
+instead of a checkout.
+
 For another Claude or Codex account, place the same skill in that account's
 configuration directory under `skills/agent-hub`. Other callers can use the CLI directly with
 `agent-hub --help`. Agent integrations must pass a distinct conversation ID on

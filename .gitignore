@@ -11,3 +11,4 @@ paths.json
 resources.json
 skill-links.json
 verification/
+.claude/

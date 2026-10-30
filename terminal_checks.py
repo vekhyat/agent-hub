@@ -1,5 +1,6 @@
 """Terminal selection and literal argv forwarding without a desktop or AI calls."""
 import os
+import tempfile
 import io
 import json
 import unittest
@@ -87,7 +88,8 @@ class TerminalChecks(unittest.TestCase):
              patch.object(hub.shutil, "which", return_value="/bin/claude"), \
              patch.object(hub, "terminal_command", side_effect=AssertionError("should not look for a terminal")), \
              patch.object(hub, "request", return_value={"name": "test", "profile": "claude"}), \
-             patch.object(hub, "wait_ready", return_value="READY"):
+             patch.object(hub, "wait_ready", return_value="READY"), \
+             tempfile.TemporaryDirectory() as records, patch.object(hub, "HELPER_RECORDS", records):
             self.assertIn("spawned claude", hub.spawn_agent("claude", "test", "/tmp", visible=False))
 
 

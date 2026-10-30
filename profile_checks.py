@@ -19,8 +19,11 @@ class ProfileChecks(unittest.TestCase):
         self.config.write_text("[profiles]\n")
         self.env = patch.dict(os.environ, {"AGENT_HUB_PROFILES": str(self.config)})
         self.env.start()
+        self.records = patch.object(hub, "HELPER_RECORDS", str(self.root / "helpers"))
+        self.records.start()
 
     def tearDown(self):
+        self.records.stop()
         self.env.stop()
         self.temp.cleanup()
 

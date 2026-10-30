@@ -375,11 +375,13 @@ class HubChecks(unittest.IsolatedAsyncioTestCase):
         hub.save_record({"name": "fixer", "kind": "claude", "session_id": "the-id", "report_id": "old",
                          "cwd": self.temp.name, "model": "opus", "effort": "high", "started": 1, "task": "fix it"})
         calls = {}
-        def spawn(kind, name, cwd, prompt, model, effort, visible, keep, resume):
+        def spawn(kind, name, cwd, prompt, model, effort, visible=True, terminal="", keep=False, resume=None):
+            calls.update(keep=keep, terminal=terminal)
             calls.update(kind=kind, cwd=cwd, model=model, effort=effort, resume=resume)
             return "spawned"
         with patch.object(hub, "spawn_agent", spawn):
-            hub.resume_agent("fixer", "next", effort="low")
+            hub.resume_agent("fixer", "next", effort="low", keep=True)
+        self.assertEqual((calls["keep"], calls["terminal"]), (True, ""))
         self.assertEqual((calls["cwd"], calls["model"], calls["effort"]), (self.temp.name, "opus", "low"))
         self.assertEqual(calls["resume"]["task"], "fix it")
 

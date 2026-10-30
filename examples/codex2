@@ -1,3 +1,0 @@
-#!/bin/sh
-export CODEX_HOME="${AGENT_HUB_CODEX2_HOME:-$HOME/.codex2}"
-exec codex "$@"

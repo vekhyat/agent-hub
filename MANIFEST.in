@@ -1,5 +1,5 @@
 include LICENSE README.md verify.py regressions.py integration.py packaging_checks.py profile_checks.py terminal_checks.py
 recursive-include docs *.md
 recursive-include skill *.md
-include SECURITY.md
+include SECURITY.md install.sh
 recursive-include examples *

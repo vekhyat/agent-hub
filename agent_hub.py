@@ -356,6 +356,87 @@ def get_profile(name: str) -> dict[str, str]:
     return profiles[name]
 
 
+def find_command(command: str) -> str | None:
+    """An agent executable on PATH, or in the user-local directories installers commonly use."""
+    binary = shutil.which(command)
+    if not binary:
+        candidate = os.path.join(HOME, ".local/bin", command)
+        binary = candidate if os.access(candidate, os.X_OK) else None
+    if not binary and command == "opencode":
+        candidate = os.path.join(HOME, ".opencode/bin/opencode")
+        binary = candidate if os.path.isfile(candidate) else None
+    return binary
+
+
+# Skill directories of agents that can call agent-hub; each is used only if its parent exists.
+SKILL_DIRS = ["~/.claude/skills", "$CODEX_HOME/skills", "~/.agents/skills", "~/.grok/skills",
+              "~/.config/opencode/skills", "~/.pi/agent/skills", "~/.gemini/config/skills"]
+
+
+def skill_source() -> str:
+    """The skill shipped with this install (wheel data files), or the checkout's copy."""
+    for path in (os.path.join(sys.prefix, "share/agent-hub/skill"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "skill")):
+        if os.path.isfile(os.path.join(path, "SKILL.md")):
+            return path
+    raise ValueError("cannot find the bundled agent-hub skill; reinstall agent-hub")
+
+
+def setup(skills: bool = True) -> tuple[str, bool]:
+    """Check what agent-hub needs on this machine and link its skill for the agents found here."""
+    lines, ready = [], True
+    def report(passed, text, hint="", required=True):
+        nonlocal ready
+        ready = ready and (passed or not required)
+        lines.append(("ok   " if passed else "MISS " if required else "warn ") + text + (f"\n     {hint}" if hint and not passed else ""))
+    report(sys.platform.startswith("linux"), "Linux", "agent-hub supports Linux only")
+    report(os.path.exists(f"/run/user/{os.getuid()}/systemd/private") and bool(shutil.which("systemd-run")),
+           "systemd user manager", "without it, helper processes are cleaned up best effort", required=False)
+    report(os.path.isfile("/sys/fs/cgroup/cgroup.controllers"), "cgroup v2",
+           "without it, helper processes are cleaned up best effort", required=False)
+    try:
+        report(True, "terminal: " + os.path.basename(terminal_command()[0]))
+    except ValueError:
+        report(False, "terminal", "install Foot, Ghostty, Kitty, Alacritty, WezTerm or xterm, or spawn with --no-window",
+               required=False)
+    found = [kind for kind in ("claude", "codex", "opencode", "grok") if find_command(INTERACTIVE[kind][0][0])]
+    report(bool(found), "agent CLIs: " + (", ".join(found) or "none"),
+           "install and sign in to at least one of claude, codex, opencode or grok")
+    on_path = shutil.which("agent-hub")
+    command_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if os.path.basename(sys.argv[0]) == "agent-hub" \
+        else "the directory holding agent-hub"
+    report(bool(on_path), "agent-hub on PATH" + (f": {on_path}" if on_path else ""),
+           f"add {command_dir} to PATH (for uv: uv tool update-shell), then restart your shell and agents",
+           required=False)
+    if on_path and HUB_ARGV[0] != sys.executable and os.path.realpath(on_path) != os.path.realpath(HUB_ARGV[0]):
+        report(False, f"another agent-hub comes first on PATH: {on_path}", f"this one is {HUB_ARGV[0]}", required=False)
+    try:
+        profiles = load_profiles()
+        report(True, f"profiles: {len(profiles) - len(INTERACTIVE)} configured, {len(INTERACTIVE)} built in")
+    except ValueError as error:
+        report(False, "profiles", str(error))
+        profiles = {}
+    if skills:
+        source = skill_source()
+        codex = os.environ.get("CODEX_HOME") or "~/.codex"
+        homes = [path.replace("$CODEX_HOME", codex) for path in SKILL_DIRS]
+        homes += [os.path.join(p["home"], "skills") for p in profiles.values() if p["home"]]
+        for directory in dict.fromkeys(os.path.expanduser(path) for path in homes):
+            target = os.path.join(directory, "agent-hub")
+            if not os.path.isdir(os.path.dirname(directory)):
+                continue
+            if os.path.lexists(target):
+                same = os.path.realpath(target) == os.path.realpath(source)
+                lines.append(("ok   skill already linked: " if same else "note kept an existing skill: ") + target)
+                continue
+            os.makedirs(directory, exist_ok=True)
+            os.symlink(source, target)
+            lines.append(f"ok   skill linked: {target}")
+    lines.append("ready: try  agent-hub spawn claude helper 'Reply READY' --cwd \"$PWD\"" if ready else
+                 "not ready: fix the MISS lines above, then run agent-hub setup again")
+    return "\n".join(lines), ready
+
+
 def list_profiles() -> str:
     return "\n".join(f"{name}\t{p['kind']}\t{p['command']}\t{p['home'] or '(native defaults)'}"
                      for name, p in load_profiles().items())
@@ -1753,13 +1834,7 @@ def spawn_agent(
     cwd = project_directory(cwd)
     argv, prompt_args = INTERACTIVE[kind]
     command = profile["command"]
-    binary = shutil.which(command)
-    if not binary:
-        candidate = os.path.join(HOME, ".local/bin", command)
-        binary = candidate if os.access(candidate, os.X_OK) else None
-    if not binary and command == "opencode":
-        candidate = os.path.join(HOME, ".opencode/bin/opencode")
-        binary = candidate if os.path.isfile(candidate) else None
+    binary = find_command(command)
     if not binary:
         raise ValueError(f"profile {profile_name!r}: {command!r} is not installed or not on PATH")
     session_id = resume["session_id"] if resume else new_session_id(kind)
@@ -1992,10 +2067,12 @@ def main():
     p = sub.add_parser("models", help="list available models")
     p.add_argument("kind", metavar="PROFILE", help="profile name; see agent-hub profiles")
     sub.add_parser("profiles", help="list built-in and configured account profiles")
+    p = sub.add_parser("setup", help="check requirements and link the skill for installed agents")
+    p.add_argument("--no-skills", action="store_true", help="only check; do not link the skill")
     p = sub.add_parser("ls", help="list sessions (does not start a daemon)")
     p.add_argument("--closed", action="store_true", help="list closed helpers you can resume")
     a = parser.parse_args()
-    OWNER = caller_owner() if a.command not in ("daemon", "tell", "done", "turn-end") else None
+    OWNER = caller_owner() if a.command not in ("daemon", "tell", "done", "turn-end", "setup") else None
     if a.command == "daemon":
         run_daemon()
         return
@@ -2012,6 +2089,12 @@ def main():
         result = available_models(a.kind)
     elif a.command == "profiles":
         result = list_profiles()
+    elif a.command == "setup":
+        result, ready = setup(skills=not a.no_skills)
+        print(result)
+        if not ready:
+            sys.exit(1)
+        return
     elif a.command == "ls":
         result = list_closed() if a.closed else list_agents() if os.path.exists(SOCK) else "no agents"
     else:

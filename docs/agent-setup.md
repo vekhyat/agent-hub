@@ -14,25 +14,23 @@ settings, and unrelated configuration. Credentials remain in the native CLIs.
    Ask for any missing account choice or project directory. Do not inspect or
    copy credential files, invent accounts, or alter native permission modes.
 
-2. Install the project or reuse an existing suitable installation.
+2. Install agent-hub, or reuse an existing suitable installation.
 
    ```sh
-   git clone https://github.com/vekhyat/agent-hub.git
-   cd agent-hub
-   uv tool install .
-   agent-hub --help
+   curl -fsSL https://raw.githubusercontent.com/vekhyat/agent-hub/main/install.sh | sh
    ```
 
-   Reuse an existing checkout instead of cloning over it. Inspect a pre-existing
-   command before replacing it. For a requested upgrade of this uv-installed
-   package, use `uv tool install --reinstall .` from the updated checkout.
-   Do not force an install over an unrelated executable or local launcher.
-   If uv is unavailable, use the virtual-environment steps in the README.
-   Ensure the calling agent can find the command on PATH.
+   The script installs with uv, pipx, or a private virtual environment, and never
+   replaces an `agent-hub` command it did not install; if it reports one in the
+   way, show the user that path and ask before removing anything. It then runs
+   `agent-hub setup`, which prints a checklist (`ok`, `warn`, `MISS`) and links
+   the skill. Fix every `MISS` line. If `agent-hub` is not on PATH, run
+   `uv tool update-shell` or add the reported directory to PATH, and tell the user
+   to restart their agent apps. Run the same command again to upgrade.
 
 3. Configure the accounts and terminal the user chose.
 
-   Read [account setup](accounts.md) and `examples/profiles.toml` in the checkout.
+   Read [account setup](accounts.md) and [the example profiles](../examples/profiles.toml).
    Merge named profiles into the user's existing profiles file. Claude uses
    `CLAUDE_CONFIG_DIR`; Codex uses `CODEX_HOME`. Existing launchers such as
    `codex1` are no longer built-in profiles; keep working ones by adding a profile
@@ -44,12 +42,11 @@ settings, and unrelated configuration. Credentials remain in the native CLIs.
 
 4. Make the skill discoverable to the requested callers.
 
-   Link or copy this checkout's `skill` directory into each chosen account's
-   skills directory as `agent-hub`. Claude and Codex use `skills/agent-hub` under
-   their selected account configuration directory. Reuse a matching existing
-   link. Preserve other existing files and ask before replacing a conflicting
-   skill installation. Other callers can use `agent-hub --help` directly or
-   install the same skill in their own discovery directory.
+   Run `agent-hub setup` again after adding profiles. It links the bundled skill
+   into each installed agent's skill directory and into `skills/agent-hub` under
+   every profile `home`, and keeps any existing entry. Report each `note kept an
+   existing skill` line to the user instead of replacing it. Other callers can use
+   `agent-hub --help` directly.
    On shared Codex app-server hosts, use `CODEX_THREAD_ID` or a unique
    `AGENT_HUB_CALLER_ID` per conversation. See [the reference](reference.md).
 
@@ -61,7 +58,7 @@ settings, and unrelated configuration. Credentials remain in the native CLIs.
    screen, then run `agent-hub wait --timeout 120`. A `[NAME done; closed]` report
    shows the helper reached the hub. Quiet output can be a permission or sign-in
    dialog. Native approvals stay with the user unless the current request already
-   authorizes them. Close a helper that did not report with `agent-hub kill NAME`. Report the checkout path,
+   authorizes them. Close a helper that did not report with `agent-hub kill NAME`. Report the
    executable path, profiles file, skill links, and any remaining sign-in step.
    Distinguish account routing from proof of which subscription authenticated.
 

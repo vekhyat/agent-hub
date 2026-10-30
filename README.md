@@ -1,74 +1,87 @@
 # agent-hub
 
-Start coding agents in visible terminal windows. Give them tasks, collect their
-reports, read their screens, switch models, and close them from another agent or
-your terminal.
+Let your coding agent start other coding agents in visible terminal windows, give
+them tasks, and collect their results. Use Claude, Codex, OpenCode, or Grok with
+the logins you already have.
 
 ```sh
-agent-hub spawn claude reviewer 'Review this project and list the top issues' --cwd "$PWD"
-agent-hub wait --timeout 900
+agent-hub spawn codex reviewer 'Review this project and list the top issues' --cwd "$PWD"
+agent-hub wait --timeout 900          # returns the reviewer's report
 agent-hub resume reviewer 'Now fix the first issue'
 ```
 
-Use Claude, Codex, OpenCode, or Grok with your existing logins. Add named
-profiles for multiple Claude or Codex subscriptions, such as `claude-work` and
-`codex-personal`. Each helper receives its own PTY and terminal window.
-Supported terminals are Foot, Ghostty, Kitty, Alacritty, WezTerm, and xterm.
-There is no tmux session or MCP server.
-
-## Point your agent at it
-
-Paste this into the coding agent you already use:
-
-```text
-Read https://raw.githubusercontent.com/vekhyat/agent-hub/main/docs/agent-setup.md
-and set up agent-hub for my installed agents and accounts. Preserve my existing
-logins, launchers, and permission settings. Configure the accounts I choose,
-use an available terminal, and verify it in the project directory I specify.
-```
-
-The [agent setup guide](docs/agent-setup.md) covers installation, account
-profiles, terminal selection, and skill discovery. Browser sign-ins remain
-interactive. Your agent does not need to read or copy credential files.
+Every helper gets its own terminal window you can watch and type into. Helpers
+report back with a command when they finish, so the agent that started them
+doesn't have to guess. Named profiles let you mix several Claude or Codex
+accounts. There is no tmux session, MCP server, or always-on service.
 
 ## Install
 
-The supported environment is **Linux with a graphical session, a supported
-terminal, a systemd user manager, and delegated cgroup v2 with `cgroup.kill`**.
-Python 3.12 or newer is required. Foot needs Wayland. Other listed terminals
-can run under Wayland or X11, depending on their installed build.
-Install and sign in to whichever agent CLIs you want to launch. Other platforms
-are untested. The process cleanup fallback without systemd is best effort.
+```sh
+curl -fsSL https://raw.githubusercontent.com/vekhyat/agent-hub/main/install.sh | sh
+```
 
-1. Clone this repository.
+The script:
 
-   ```sh
-   git clone https://github.com/vekhyat/agent-hub.git
-   cd agent-hub
-   ```
+- installs the `agent-hub` command with [uv](https://docs.astral.sh/uv/) if you
+  have it, otherwise pipx, otherwise a private Python virtual environment;
+- never replaces an `agent-hub` command it did not install;
+- runs `agent-hub setup`, which checks your machine and links the agent-hub skill
+  into the agents it finds (Claude, Codex, Grok, OpenCode, Pi, Gemini and
+  `~/.agents`), keeping any skill you already have there.
 
-2. Install the CLI in an isolated Python environment with `uv`.
+Run the same command again to upgrade. If `setup` reports that `agent-hub` is not
+on your PATH, run `uv tool update-shell` (for uv installs) or add `~/.local/bin`
+to PATH, then restart your terminal and agents.
 
-   ```sh
-   uv tool install .
-   ```
+**You need:** Linux with a graphical session, Python 3.12 or newer (uv fetches it
+if missing), at least one agent CLI you've signed in to, and a supported terminal:
+Foot, Ghostty, Kitty, Alacritty, WezTerm, or xterm. A systemd user session with
+cgroup v2 gives reliable cleanup of helper processes; without it cleanup is best
+effort. Other platforms are untested.
 
-   Alternatively, use a virtual environment.
+<details>
+<summary>Install by hand, check, or uninstall</summary>
 
-   ```sh
-   python3 -m venv .venv
-   .venv/bin/python -m pip install .
-   export PATH="$PWD/.venv/bin:$PATH"
-   ```
+```sh
+uv tool install "agent-hub @ https://github.com/vekhyat/agent-hub/archive/refs/heads/main.tar.gz"
+# or: pipx install https://github.com/vekhyat/agent-hub/archive/refs/heads/main.tar.gz
+agent-hub setup          # check requirements and link the skill
+agent-hub setup --no-skills   # only check
+```
 
-3. Check that the command is available to the calling agent.
+Uninstall with `uv tool uninstall agent-hub` or `pipx uninstall agent-hub`. For
+the script's fallback install, remove `~/.local/share/agent-hub-venv` and
+`~/.local/bin/agent-hub`. Then remove the `skills/agent-hub` links that `setup`
+listed.
 
-   ```sh
-   agent-hub --help
-   ```
+</details>
 
-   If your shell cannot find a uv-installed command, run `uv tool update-shell`
-   and restart the terminal. Restart existing agent apps to pick up PATH changes.
+## Point your agent at it
+
+The easiest setup: paste this into the coding agent you already use.
+
+```text
+Install agent-hub for me by running
+curl -fsSL https://raw.githubusercontent.com/vekhyat/agent-hub/main/install.sh | sh
+then follow https://raw.githubusercontent.com/vekhyat/agent-hub/main/docs/agent-setup.md.
+Keep my existing logins, launchers, and permission settings. Ask me which
+accounts to set up and which project directory to test in, then prove it works
+by starting one helper and collecting its report.
+```
+
+Your agent installs the command, sets up any extra accounts you choose, and runs a
+test helper. Sign-ins stay in each agent's own browser flow; your agent never
+needs to read credential files.
+
+Once it's set up, ask your agent in plain words and name agent-hub, for example:
+
+- "Use agent-hub to have Codex review this branch while you write the tests."
+- "Use agent-hub to start a Claude helper on my work account to fix the lint errors."
+- "Use agent-hub to resume the reviewer and ask it to check your fix."
+
+The skill only triggers when you mention agent-hub, so ordinary requests behave as
+before.
 
 ## Start a helper
 
@@ -181,24 +194,13 @@ windows have not been tested yet.
 
 ## Let another agent use the CLI
 
-The [shared skill](skill/SKILL.md) teaches the command workflow on demand. Copy
-or link its directory into the caller's skill directory. For example, from this
-checkout, if these destinations do not already exist:
+`agent-hub setup` links the [shared skill](skill/SKILL.md) into each installed
+agent's skill directory, and into the `skills` directory of every profile with a
+`home`. Run it again after adding an agent or a profile. For any other caller,
+link `skill/` from a checkout yourself, or let it use `agent-hub --help` directly.
 
-```sh
-mkdir -p "$HOME/.codex/skills" "$HOME/.claude/skills"
-ln -s "$PWD/skill" "$HOME/.codex/skills/agent-hub"
-ln -s "$PWD/skill" "$HOME/.claude/skills/agent-hub"
-```
-
-Installing the package also places a copy at `<prefix>/share/agent-hub/skill/`
-(for `uv tool install`, inside the tool's environment), so you can link that
-instead of a checkout.
-
-For another Claude or Codex account, place the same skill in that account's
-configuration directory under `skills/agent-hub`. Other callers can use the CLI directly with
-`agent-hub --help`. Agent integrations must pass a distinct conversation ID on
-shared hosts. See [ownership and configuration](docs/reference.md).
+Agent integrations on shared hosts must pass a distinct conversation ID. See
+[ownership and configuration](docs/reference.md).
 
 ## Resource use and limits
 
@@ -224,9 +226,10 @@ authorized scope. See [the security notes](SECURITY.md).
 
 ## Run checks
 
-Create a development environment in the checkout:
+Create a development environment in a checkout:
 
 ```sh
+git clone https://github.com/vekhyat/agent-hub.git && cd agent-hub
 python3 -m venv .venv
 .venv/bin/python -m pip install .
 .venv/bin/python -m unittest -v verify regressions packaging_checks profile_checks terminal_checks

@@ -18,6 +18,7 @@
 | `attach NAME` | Attaches the current terminal. Ctrl-] detaches without stopping the agent. |
 | `kill NAME` | Stops the helper and its managed descendants before returning. |
 | `profiles` | Lists built-in and configured account profiles, agent families, commands, and homes. |
+| `setup` | Checks Linux, the systemd user manager, cgroup v2, a terminal, agent CLIs, PATH, and the profiles file, then links the bundled skill as `skills/agent-hub` into each installed agent's skill directory and each profile `home`. Existing entries are kept. `--no-skills` only checks. Exits 1 when a required item is missing. |
 | `ls` | Lists your sessions as `busy` or `quiet XmYYs`, without starting a daemon. `--closed` lists resumable helpers. |
 
 `turn-end ID` also exists. Helper hooks call it; it is not for direct use.

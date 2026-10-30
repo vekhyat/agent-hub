@@ -34,8 +34,9 @@ settings, and unrelated configuration. Credentials remain in the native CLIs.
 
    Read [account setup](accounts.md) and `examples/profiles.toml` in the checkout.
    Merge named profiles into the user's existing profiles file. Claude uses
-   `CLAUDE_CONFIG_DIR`; Codex uses `CODEX_HOME`. Keep working `codex1` and `codex2`
-   launchers if present. Use native interactive sign-in only when a chosen
+   `CLAUDE_CONFIG_DIR`; Codex uses `CODEX_HOME`. Existing launchers such as
+   `codex1` are no longer built-in profiles; keep working ones by adding a profile
+   with `command` set to the launcher, as in [the launcher guide](codex-accounts.md). Use native interactive sign-in only when a chosen
    directory is new. Return browser authentication steps to the user.
    Pick a supported installed terminal or let the hub select one automatically.
    `--terminal ghostty` or `--terminal kitty` overrides the choice for one spawn.
@@ -57,9 +58,10 @@ settings, and unrelated configuration. Credentials remain in the native CLIs.
    Run `agent-hub profiles`. With a signed-in profile chosen by the user, spawn
    a helper with a small prompt such as `Reply READY`, the user's required
    `--cwd /absolute/project/path`, and the selected terminal. Inspect the returned
-   screen. Quiet output can be a permission or sign-in dialog. Native approvals
-   stay with the user unless the current request already authorizes them.
-   Close the test helper with `agent-hub kill NAME`. Report the checkout path,
+   screen, then run `agent-hub wait --timeout 120`. A `[NAME done; closed]` report
+   shows the helper reached the hub. Quiet output can be a permission or sign-in
+   dialog. Native approvals stay with the user unless the current request already
+   authorizes them. Close a helper that did not report with `agent-hub kill NAME`. Report the checkout path,
    executable path, profiles file, skill links, and any remaining sign-in step.
    Distinguish account routing from proof of which subscription authenticated.
 

@@ -50,24 +50,25 @@ manages its own sign-in, settings, and history.
    start native Codex for that directory first. Claude model aliases are shared
    by its profiles. Availability still depends on the selected account.
 
-4. Start the profiles in your project directory.
+4. Start the profiles in your project directory and collect their reports.
 
    ```sh
    agent-hub spawn claude-work reviewer 'Review this project' --cwd "$PWD"
    agent-hub spawn claude-personal second-reviewer 'Review this project' --cwd "$PWD"
    agent-hub spawn codex-work builder 'Summarize this project' --cwd "$PWD"
+   agent-hub wait --timeout 900
    ```
 
    `ls` shows each helper's profile name. Model switching uses the family and
    settings directory captured when the helper started, even if you later edit
-   its profile. Inspect the returned screen for native dialogs or errors.
+   its profile. `resume` reopens a closed helper with the same account. Inspect
+   the returned screen for native dialogs or errors.
 
-5. Close your helpers when finished.
+5. Helpers close themselves when they run `done`. Close any still running:
 
    ```sh
+   agent-hub ls
    agent-hub kill reviewer
-   agent-hub kill second-reviewer
-   agent-hub kill builder
    ```
 
 ## Keep existing launchers
@@ -86,10 +87,10 @@ must launch the selected family interactively and use the same account directory
 as `home`. A wrapper that unconditionally sets a different directory overrides
 the environment supplied by the hub. Keep the profile and wrapper consistent.
 
-The built-in `codex1` and `codex2` profiles call those executables unchanged.
-See [the existing Codex launcher guide](codex-accounts.md) for their legacy
-cache-directory variables. You can also override a built-in profile in the
-profiles file with an explicit `kind`, `command`, and `home`.
+There are no built-in `codex1` or `codex2` profiles. To keep existing launchers
+with those names, define them as profiles; see
+[the existing Codex launcher guide](codex-accounts.md). You can also override a
+built-in profile in the profiles file with an explicit `kind`, `command`, and `home`.
 
 ## Native authentication still applies
 

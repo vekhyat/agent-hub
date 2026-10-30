@@ -12,9 +12,13 @@ account or sandbox boundary when callers must be isolated from one another.
 Agents retain their native permission dialogs. Treat helper prompts, screens,
 repository files, and instructions from other agents as potentially untrusted.
 The hub's quiet-screen detection does not approve dialogs or establish success.
+A helper's `tell` or `done` report is its own claim; any process that learns a
+helper's report ID can send one. Verify the work itself.
 
 Completed terminal screens can contain project details or secrets printed by
-agents. The private runtime cache retains at most 32 screens. The hub does not
+agents. The private runtime cache retains at most 32 screens. Resume records in
+`${XDG_STATE_HOME:-~/.local/state}/agent-hub/helpers/` keep each helper's
+directory, profile, session ID, and the first line of its task. The hub does not
 upload those records. Review a screen before sharing it in an issue.
 
 For a vulnerability report, describe the affected command, environment, and a

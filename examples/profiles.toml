@@ -16,3 +16,10 @@ home = "~/.codex-work"
 [profiles.codex-personal]
 kind = "codex"
 home = "~/.codex-personal"
+
+# An existing launcher executable can be kept as a profile.
+# Its home must match the directory the launcher selects.
+# [profiles.codex1]
+# kind = "codex"
+# command = "codex1"
+# home = "~/.codex"

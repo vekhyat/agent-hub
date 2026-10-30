@@ -1,13 +1,13 @@
 # agent-hub
 
-Start coding agents in visible terminal windows. Send prompts, read their screens,
-switch models, and close their processes from another agent or your terminal.
+Start coding agents in visible terminal windows. Give them tasks, collect their
+reports, read their screens, switch models, and close them from another agent or
+your terminal.
 
 ```sh
-agent-hub spawn claude reviewer 'Review this project' --cwd "$PWD"
-agent-hub ask reviewer 'Which issue should I fix first?'
-agent-hub read reviewer --lines 100
-agent-hub kill reviewer
+agent-hub spawn claude reviewer 'Review this project and list the top issues' --cwd "$PWD"
+agent-hub wait --timeout 900
+agent-hub resume reviewer 'Now fix the first issue'
 ```
 
 Use Claude, Codex, OpenCode, or Grok with your existing logins. Add named
@@ -73,31 +73,48 @@ are untested. The process cleanup fallback without systemd is best effort.
 ## Start a helper
 
 1. Choose an existing project directory. `--cwd` is required for every spawn.
+   Put the whole task in the spawn prompt.
 
    ```sh
-   agent-hub spawn claude helper 'Reply READY' --cwd "$PWD"
+   agent-hub spawn claude helper 'Summarize the files in this directory' --cwd "$PWD"
    ```
 
    A terminal window opens. The command returns the helper's screen, including any
    trust, sign-in, or permission dialog. Inspect that screen before continuing.
 
-2. Send work to the helper.
+   The hub appends a short brief to the helper's first prompt. It tells the helper
+   to run `agent-hub tell ID "message"` to ask the spawner a question and
+   `agent-hub done ID "result"` to finish, using the hub's absolute path.
+
+2. Wait for the helper's report.
 
    ```sh
-   agent-hub ask helper 'Summarize the files in this directory'
+   agent-hub wait --timeout 900
    ```
 
-3. Close the helper when the task ends.
+   Without a name, `wait` returns the first report from any of your helpers. It
+   also returns when a helper has been quiet for 30 seconds without reporting,
+   which usually means a permission dialog, or once all your helpers are quiet.
+   Answer a `tell` question with `agent-hub send helper 'answer'`, then wait again.
+
+3. `done` delivers the result and closes the helper. To continue later, reopen
+   its conversation instead of starting over:
 
    ```sh
-   agent-hub kill helper
+   agent-hub ls --closed
+   agent-hub resume helper 'Now write the summary to NOTES.md'
    ```
 
-   The daemon stops 10 seconds after the last helper finishes. Completed screens
-   remain readable from the private runtime cache.
+   Use `agent-hub kill helper` to stop a helper early. Helpers spawned with
+   `--keep` stay open after `done` and must be killed.
 
-For a default Codex installation, use `agent-hub spawn codex ...`. Existing
-`codex1` and `codex2` executable launchers also remain supported.
+Claude and Codex helpers also get a per-launch turn-end hook. A helper that ends
+its turn without running `done` appears in `wait` as
+`[helper ended its turn without reporting]` with its last reply. Grok and
+OpenCode have no hook; `wait` falls back to quiet-screen detection for them.
+
+The daemon stops 10 seconds after the last helper closes and its reports have
+been collected. Completed screens remain readable from the private runtime cache.
 
 ## Use multiple accounts
 
@@ -133,7 +150,7 @@ agent-hub spawn codex-personal builder 'Summarize this project' --cwd "$PWD"
 
 Claude profiles set `CLAUDE_CONFIG_DIR`. Codex profiles set `CODEX_HOME`.
 No wrapper scripts are required for these named profiles. Profiles can also
-use existing executable launchers with `command = "your-launcher"`.
+use existing executable launchers, such as `command = "codex1"`.
 See [account setup and sign-in](docs/accounts.md) for the complete steps.
 
 ## Choose a terminal
@@ -151,15 +168,16 @@ Set `AGENT_HUB_TERMINAL=kitty` in your caller's environment to choose a default.
 `--terminal` takes precedence. `--no-window` keeps the interactive PTY and lets
 you attach later, without requiring a terminal emulator at spawn time.
 
-On Hyprland 0.56 or newer, helper windows open on the spawning agent's workspace
-without taking focus or switching your workspace. Nested helpers follow their
-parent's current terminal workspace, including after you move it. Detached callers
+Workspace placement is optional. On Hyprland 0.56 or newer, helper windows open
+on the spawning agent's workspace without taking focus or switching your workspace.
+Nested helpers follow their parent's current terminal workspace, including after
+you move it. Detached callers
 with no identifiable window must set `AGENT_HUB_WORKSPACE=2` (or `name:project` /
 `special:agents`) or use `--no-window`. Other desktops retain their normal placement.
 
-Foot, Ghostty, and Alacritty have passed live window tests on the maintainer's
-Linux desktop. Kitty, WezTerm, and xterm use their native command-line adapters
-and have selection tests; their live windows have not been tested there yet.
+Foot, Ghostty, and Alacritty have passed live window tests. Kitty, WezTerm, and
+xterm use their native command-line adapters and have selection tests; their live
+windows have not been tested yet.
 
 ## Let another agent use the CLI
 
@@ -185,9 +203,15 @@ It loads `pyte` to keep a readable terminal screen. Agents and terminal emulator
 consume their own resources. There is no permanently running background service
 when all helpers have finished. This tool does consume memory and CPU while active.
 
-Quiet output is the signal used by `wait`. A permission dialog, error, or finished
-reply can all look quiet. Model switching depends on each agent's terminal UI and
-may need updates when those UIs change. Inspect the returned screen.
+Helper reports are the main signal used by `wait`; quiet output is the fallback.
+A permission dialog, error, or finished reply can all look quiet. A report is the
+helper's own claim, so check the work before treating a task as done. Model
+switching depends on each agent's terminal UI and may need updates when those UIs
+change. Inspect the returned screen.
+
+Forgotten idle helpers owned by an agent are closed after `AGENT_HUB_MAX_IDLE`
+seconds (default 1800; `0` disables). `wait` reports the closure. `--keep` helpers
+are exempt. At most 8 helpers run at once and nesting stops at depth 2 by default.
 
 Ownership isolates normal CLI workflows between conversations. Any process
 running as your Unix user can access the raw socket. **The hub is not a sandbox

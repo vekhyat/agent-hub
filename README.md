@@ -1,21 +1,67 @@
 # agent-hub
 
-Let your coding agent start other coding agents in visible terminal windows, give
-them tasks, and collect their results. Use Claude, Codex, OpenCode, or Grok with
-the logins you already have.
+**A command-line tool your coding agent uses to start other coding agents, give
+them tasks, and collect their results.**
 
-```sh
-agent-hub spawn codex reviewer 'Review this project and list the top issues' --cwd "$PWD"
-agent-hub wait --timeout 900          # returns the reviewer's report
-agent-hub resume reviewer 'Now fix the first issue'
+Your agent (Claude Code, Codex, OpenCode, Grok, Pi, Gemini, or anything with a
+shell) runs `agent-hub` to open helpers. Each helper is a real interactive Claude,
+Codex, OpenCode, or Grok session in its own terminal window, signed in with your
+existing logins. You can watch every helper and type into any of them.
+
+```text
+You:     Use agent-hub to have Codex review this branch while you write the tests.
+
+Agent:   $ agent-hub spawn codex reviewer 'Review this branch and list the top issues' --cwd ~/app
+         ...writes the tests...
+         $ agent-hub wait --timeout 900
+         [reviewer done; closed]
+         1. Race in cache.py:88 ...
 ```
 
-Every helper gets its own terminal window you can watch and type into. Helpers
-report back with a command when they finish, so the agent that started them
-doesn't have to guess. Named profiles let you mix several Claude or Codex
-accounts. There is no tmux session, MCP server, or always-on service.
+## Why agents need it
 
-## Install
+- **Results come back as reports.** Every helper is told to run
+  `agent-hub done ID "result"` when finished and `agent-hub tell ID "question"` to
+  ask something. Claude and Codex helpers also report automatically when a turn
+  ends. The calling agent never has to scrape a screen to know a helper is done.
+- **One call waits on many helpers.** `agent-hub wait` returns the first report,
+  and flags a helper that is stuck on a permission dialog.
+- **Real sessions, real accounts.** Helpers run the normal interactive CLIs with
+  your logins. Profiles add more Claude or Codex accounts, and `resume` reopens a
+  finished helper's conversation later.
+- **Just a CLI.** No MCP server, tool schemas, tmux, or always-on service. The
+  bundled skill teaches your agent the commands, and loads only when you mention
+  agent-hub.
+
+## Set it up: hand this to your agent
+
+Paste this into the coding agent you already use:
+
+```text
+Install agent-hub for me by running
+curl -fsSL https://raw.githubusercontent.com/vekhyat/agent-hub/main/install.sh | sh
+then follow https://raw.githubusercontent.com/vekhyat/agent-hub/main/docs/agent-setup.md.
+Keep my existing logins, launchers, and permission settings. Ask me which
+accounts to set up and which project directory to test in, then prove it works
+by starting one helper and collecting its report.
+```
+
+Your agent installs the command, links the skill into your agents, sets up any
+extra accounts you choose, and runs a test helper. Sign-ins stay in each CLI's
+own browser flow; your agent never needs to read credential files.
+
+## What to ask for
+
+Name agent-hub in plain words. For example:
+
+- "Use agent-hub to have Codex review this branch while you write the tests."
+- "Use agent-hub to start a Claude helper on my work account to fix the lint errors."
+- "Use agent-hub to get second opinions from Codex and Grok on this design, then compare them."
+- "Use agent-hub to resume the reviewer and ask it to check your fix."
+
+Requests that don't mention agent-hub behave as before.
+
+## Install it yourself
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/vekhyat/agent-hub/main/install.sh | sh
@@ -57,33 +103,9 @@ listed.
 
 </details>
 
-## Point your agent at it
+## How your agent drives it
 
-The easiest setup: paste this into the coding agent you already use.
-
-```text
-Install agent-hub for me by running
-curl -fsSL https://raw.githubusercontent.com/vekhyat/agent-hub/main/install.sh | sh
-then follow https://raw.githubusercontent.com/vekhyat/agent-hub/main/docs/agent-setup.md.
-Keep my existing logins, launchers, and permission settings. Ask me which
-accounts to set up and which project directory to test in, then prove it works
-by starting one helper and collecting its report.
-```
-
-Your agent installs the command, sets up any extra accounts you choose, and runs a
-test helper. Sign-ins stay in each agent's own browser flow; your agent never
-needs to read credential files.
-
-Once it's set up, ask your agent in plain words and name agent-hub, for example:
-
-- "Use agent-hub to have Codex review this branch while you write the tests."
-- "Use agent-hub to start a Claude helper on my work account to fix the lint errors."
-- "Use agent-hub to resume the reviewer and ask it to check your fix."
-
-The skill only triggers when you mention agent-hub, so ordinary requests behave as
-before.
-
-## Start a helper
+This is the loop the skill teaches. You can run the same commands yourself.
 
 1. Choose an existing project directory. `--cwd` is required for every spawn.
    Put the whole task in the spawn prompt.
@@ -192,7 +214,7 @@ Foot, Ghostty, and Alacritty have passed live window tests. Kitty, WezTerm, and
 xterm use their native command-line adapters and have selection tests; their live
 windows have not been tested yet.
 
-## Let another agent use the CLI
+## The skill
 
 `agent-hub setup` links the [shared skill](skill/SKILL.md) into each installed
 agent's skill directory, and into the `skills` directory of every profile with a

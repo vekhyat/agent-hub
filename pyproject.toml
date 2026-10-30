@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agent-hub"
 version = "0.2.0"
-description = "Drive interactive coding agents and named accounts in visible terminals"
+description = "A CLI your coding agent uses to start other coding agents in visible terminals and collect their results"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"

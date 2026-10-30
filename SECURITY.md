@@ -21,6 +21,8 @@ agents. The private runtime cache retains at most 32 screens. Resume records in
 directory, profile, session ID, and the first line of its task. The hub does not
 upload those records. Review a screen before sharing it in an issue.
 
-For a vulnerability report, describe the affected command, environment, and a
+Report a vulnerability privately through
+[GitHub's private vulnerability reporting](https://github.com/vekhyat/agent-hub/security/advisories/new),
+not in a public issue. Describe the affected command, environment, and a
 minimal reproduction with synthetic data. Do not include tokens, credentials,
 private transcripts, or personal settings files in a public report.

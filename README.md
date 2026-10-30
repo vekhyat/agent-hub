@@ -241,8 +241,9 @@ services and terminal windows for the supported emulators installed on the test 
 ```
 
 The integration suite needs the supported desktop environment described above.
-GitHub Actions runs the local checks on Python 3.12, 3.13, and 3.14. It does not
-claim to validate the desktop integration.
+GitHub Actions installs the package and runs the local checks against that install,
+from outside the checkout, on Python 3.12, 3.13, and 3.14. It does not claim to
+validate the desktop integration.
 
 ## Files and license
 

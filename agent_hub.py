@@ -1736,7 +1736,13 @@ def spawn_agent(
     if DEPTH >= MAX_DEPTH:
         raise RuntimeError(f"agent-hub depth limit reached ({DEPTH}/{MAX_DEPTH}); do the work yourself")
     profile_name = kind
-    profile = get_profile(profile_name)
+    if resume and "home" in resume:  # the kind and account it ran with, whatever its profile says now
+        current = load_profiles().get(profile_name, {})
+        kind = resume["kind"]
+        profile = {"kind": kind, "home": resume["home"],
+                   "command": current["command"] if current.get("kind") == kind else INTERACTIVE[kind][0][0]}
+    else:
+        profile = get_profile(profile_name)
     kind = profile["kind"]
     check_value("model", model)
     check_value("effort", effort)
@@ -1765,8 +1771,11 @@ def spawn_agent(
     workspace = caller_workspace(os.environ) if visible else os.environ.get("AGENT_HUB_WORKSPACE", "")
     context_keys = {"AGENT_HUB_CALLER_ID", "AGENT_HUB_VIEW_OWNER", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "PI_SESSION_ID", "OPENCODE_SESSION_ID"}
     env = {k: v for k, v in os.environ.items() if not PARENT_ENV.match(k) and k not in context_keys}
+    account = {"claude": "CLAUDE_CONFIG_DIR", "codex": "CODEX_HOME"}.get(kind, "")
     if profile["home"]:
-        env["CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"] = profile["home"]
+        env[account] = profile["home"]
+    elif profile["home"] is None:  # resuming one that ran on its CLI's native default, not the caller's account
+        env.pop(account, None)
     env["PATH"] = os.pathsep.join(dict.fromkeys([
         *os.get_exec_path(env), os.path.join(HOME, ".local/bin"),
         os.path.join(HOME, ".local/share/mise/command-wrappers/bin"),  # mise-installed agent CLIs
@@ -1788,25 +1797,30 @@ def spawn_agent(
     if not outdated:
         argv = argv + turn_hook_args(kind, report_id)
     argv = argv + (prompt_args(prompt + ("" if outdated else helper_brief(report_id, keep))) if prompt else [])
-    result = request("spawn", name=name, kind=kind, profile=profile_name, argv=argv, cwd=cwd, env=env, depth=DEPTH,
-                     parent=PARENT, visible=visible, terminal=terminal, workspace=workspace, keep=keep,
-                     briefed=bool(prompt), report_id=report_id, hub=HUB_COMMAND,
-                     previous=resume["report_id"] if resume else None)
+    upgrade = ("running daemon does not support account profiles and terminal selection; "
+               "close existing helpers, wait 10 seconds, and retry")
+    try:
+        result = request("spawn", name=name, kind=kind, profile=profile_name, argv=argv, cwd=cwd, env=env, depth=DEPTH,
+                         parent=PARENT, visible=visible, terminal=terminal, workspace=workspace, keep=keep,
+                         briefed=bool(prompt), report_id=report_id, hub=HUB_COMMAND,
+                         previous=resume["report_id"] if resume else None)
+    except RuntimeError as error:  # a daemon from before profiles knows Codex only as codex1 and codex2
+        if str(error).startswith("use ") and kind not in str(error)[4:].split(", "):
+            raise RuntimeError(upgrade) from None
+        raise
     name = result["name"]
-    if result.get("profile") != profile_name:
+    if result.get("profile") != profile_name:  # every daemon that echoes the profile also places workspaces
         request("kill", name=name)
-        raise RuntimeError("running daemon does not support account profiles and terminal selection; "
-                           "close existing helpers, wait 10 seconds, and retry")
+        raise RuntimeError(upgrade)
     if not resume:
         keep_closed_record(name)
-    save_record({"name": name, "profile": profile_name, "kind": kind, "home": profile["home"],
+    # The account it ran with, so resume needs neither its profile nor the caller's environment.
+    # None is Claude's native default, which must stay unset; Codex's default is just ~/.codex.
+    home = env.get(account) or (os.path.join(HOME, ".codex") if kind == "codex" else None)
+    save_record({"name": name, "profile": profile_name, "kind": kind, "home": home,
                  "session_id": session_id, "report_id": report_id, "cwd": cwd,
                  "model": model, "effort": effort, "started": time.time(),
                  "task": prompt.split("\n")[0][:80] or (resume["task"] if resume else "")})
-    if visible and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and "workspace" not in result:
-        request("kill", name=name)
-        raise RuntimeError("running daemon does not support workspace placement; "
-                           "close existing helpers, wait 10 seconds, and retry")
     if outdated:
         print("warning: the running daemon predates helper reports; this helper will not report or "
               "close itself, so kill it when finished", file=sys.stderr)
@@ -1815,7 +1829,7 @@ def spawn_agent(
 
 def resume_agent(name: str, prompt: str = "", model: str = "", effort: str = "",
                  visible: bool = True, keep: bool = False) -> str:
-    """Reopen a closed helper with its conversation intact, in its original directory."""
+    """Reopen a closed helper with its conversation intact, in its original directory and account."""
     record = load_record(name)
     record["session_id"] = record["session_id"] or codex_session_id(record)
     return spawn_agent(record.get("profile", record["kind"]), name, record["cwd"], prompt, model or record["model"],

@@ -61,8 +61,9 @@ manages its own sign-in, settings, and history.
 
    `ls` shows each helper's profile name. Model switching uses the family and
    settings directory captured when the helper started, even if you later edit
-   its profile. `resume` reopens a closed helper with the same account. Inspect
-   the returned screen for native dialogs or errors.
+   its profile. `resume` reopens a closed helper with the same family and account,
+   even if you later edit or remove its profile. Inspect the returned screen for
+   native dialogs or errors.
 
 5. Helpers close themselves when they run `done`. Close any still running:
 

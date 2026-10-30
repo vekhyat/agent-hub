@@ -11,11 +11,25 @@ jobs:
     strategy:
       matrix:
         python: ["3.12", "3.13", "3.14"]
+    env:
+      CHECKS: verify regressions packaging_checks profile_checks terminal_checks
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install .
-      - run: python -m unittest -v verify regressions packaging_checks profile_checks terminal_checks
+      # Outside the checkout, so `import agent_hub` finds the installed package, not ./agent_hub.py.
+      - run: mkdir "$RUNNER_TEMP/checks" && for name in $CHECKS; do cp "$name.py" "$RUNNER_TEMP/checks/"; done
+      - name: Check that the tests import the installed package
+        working-directory: ${{ runner.temp }}/checks
+        run: |
+          python - <<'EOF'
+          import os, sys, agent_hub
+          print(agent_hub.__file__)
+          if os.path.realpath(agent_hub.__file__).startswith(os.path.realpath(os.environ["GITHUB_WORKSPACE"]) + os.sep):
+              sys.exit("agent_hub was imported from the checkout, not the installed package")
+          EOF
+      - working-directory: ${{ runner.temp }}/checks
+        run: python -m unittest -v $CHECKS
       - run: agent-hub --help

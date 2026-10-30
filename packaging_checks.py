@@ -16,9 +16,10 @@ class PackagingChecks(unittest.TestCase):
         env = {k: v for k, v in os.environ.items()
                if k not in {"CODEX_HOME", "AGENT_HUB_CODEX1_HOME", "AGENT_HUB_CODEX2_HOME"}}
         env.update(values)
+        # The module under test, not whichever agent_hub the child's working directory would import.
         result = subprocess.run(
-            [sys.executable, "-c", "import json,agent_hub;print(json.dumps(agent_hub.CODEX_HOMES))"],
-            env=env, text=True, capture_output=True, check=True)
+            [sys.executable, "-c", "import json,runpy,sys;print(json.dumps(runpy.run_path(sys.argv[1])['CODEX_HOMES']))",
+             hub.__file__], env=env, text=True, capture_output=True, check=True)
         return json.loads(result.stdout)
 
     def test_codex_home_default_is_portable(self):

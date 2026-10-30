@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -216,6 +217,14 @@ class HubChecks(unittest.IsolatedAsyncioTestCase):
                 await hub.dispatch({"op": "paste", "name": "one", "owner": "agent-a", "text": text, "brief": True})
         self.assertIn(hub.HUB_COMMAND + " done id-one", pasted[0])
         self.assertEqual(pasted[1], "second")
+
+    def test_daemon_brief_fallback_runs_without_the_callers_path(self):
+        # A client older than the hub field leaves the daemon to brief with its own command, as above.
+        argv = shlex.split(hub.HUB_COMMAND)
+        self.assertTrue(all(os.path.isabs(arg) for arg in argv))
+        result = subprocess.run([*argv, "--help"], cwd="/", env={"HOME": str(Path.home()), "PATH": "/nonexistent"},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     async def test_slash_commands_and_briefed_spawns_are_not_briefed(self):
         session = await self.spawn()

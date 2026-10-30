@@ -65,7 +65,12 @@ and any observed settings conflict warnings.
 Each spawn saves a small record under
 `${XDG_STATE_HOME:-~/.local/state}/agent-hub/helpers/`, keeping the newest 200.
 `resume NAME` reopens that helper's native session in its original directory and
-profile, from any conversation. It accepts `--model`, `--effort`, `--no-window`,
+account, from any conversation. The record keeps the helper's family and the
+account directory it ran with: its profile's `home`, or the `CODEX_HOME` or
+`CLAUDE_CONFIG_DIR` it inherited. Editing or removing the profile, or resuming
+from another environment, does not change that account. The profile's current
+command is used while the profile exists with the same family; otherwise the
+family's default command is. It accepts `--model`, `--effort`, `--no-window`,
 and `--keep`. If a new helper reuses a closed helper's name, the old record stays
 resumable as `NAME-<reportid>`. `ls --closed` lists the records.
 
@@ -103,9 +108,11 @@ Claude settings path with each running helper.
 After upgrading from a version without profile support, close its existing
 helpers and let its daemon stop before using the new CLI. A new CLI rejects an
 old daemon's spawn response and closes that newly created helper, so the old
-daemon cannot silently ignore account or terminal selections. A daemon started
-before helper reports existed still spawns helpers, with a warning: those helpers
-get no brief or hook, cannot report, and must be killed.
+daemon cannot silently ignore account or terminal selections. An old daemon's
+refusal of a family it does not know, such as `codex`, gets the same advice to
+close its helpers and retry. A daemon started before helper reports existed
+still spawns helpers, with a warning: those helpers get no brief or hook, cannot
+report, and must be killed.
 
 ## Terminal selection
 

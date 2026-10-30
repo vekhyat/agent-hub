@@ -5,6 +5,7 @@ import os
 import sys
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -116,16 +117,111 @@ class ProfileChecks(unittest.TestCase):
             hub.load_profiles()
 
     def test_old_daemon_cannot_silently_ignore_new_profile_options(self):
-        operations = []
-        def request(op, **args):
-            operations.append(op)
-            return {"name": "test"} if op == "spawn" else {}
-        with patch.object(hub, "request", request), patch.object(hub, "wait_ready") as wait, \
-             patch.object(hub.shutil, "which", return_value="/bin/claude"):
-            with self.assertRaisesRegex(RuntimeError, "running daemon does not support"):
-                hub.spawn_agent("claude", "test", self.temp.name, visible=False)
-        self.assertEqual(operations, ["reports", "spawn", "kill"])
-        wait.assert_not_called()
+        # Daemons from before profiles: the first package, and the unpackaged one that already placed workspaces.
+        for reply in ({"name": "test"}, {"name": "test", "workspace": "1"}):
+            operations = []
+            def request(op, **args):
+                operations.append(op)
+                return reply if op == "spawn" else {}
+            with self.subTest(reply=reply), patch.object(hub, "request", request), \
+                 patch.object(hub, "wait_ready") as wait, patch.object(hub.shutil, "which", return_value="/bin/claude"):
+                with self.assertRaisesRegex(RuntimeError, "running daemon does not support"):
+                    hub.spawn_agent("claude", "test", self.temp.name, visible=False)
+                self.assertEqual(operations, ["reports", "spawn", "kill"])
+                wait.assert_not_called()
+                self.assertEqual(hub.load_records(), [])  # nothing to resume for the helper it killed
+
+    def test_old_daemon_refusing_codex_asks_for_a_restart(self):
+        upgrade = ("running daemon does not support account profiles and terminal selection; "
+                   "close existing helpers, wait 10 seconds, and retry")
+        for error, expected in (("use claude, codex1, codex2, opencode, grok", upgrade),
+                                ("an agent named 'test' already exists", "an agent named 'test' already exists")):
+            operations = []
+            def request(op, **args):
+                operations.append(op)
+                raise RuntimeError(error if op == "spawn" else f"unknown operation {op!r}")
+            with self.subTest(error=error), patch.object(hub, "request", request), \
+                 patch.object(hub.shutil, "which", return_value="/bin/codex"):
+                with self.assertRaises(RuntimeError) as raised:
+                    hub.spawn_agent("codex", "test", self.temp.name, "task", visible=False)
+                self.assertEqual(str(raised.exception), expected)
+                self.assertEqual(operations, ["reports", "spawn"])
+                self.assertEqual(hub.load_records(), [])
+
+    def launched(self, call, *args, **kwargs):
+        """Run a spawn or resume against a fake daemon; return the spawn request it sent."""
+        sent = {}
+        def request(op, **req):
+            if op == "reports":
+                return {"reports": []}
+            sent.update(req)
+            return {"name": req["name"], "profile": req["profile"], "workspace": ""}
+        with patch.object(hub, "request", request), patch.object(hub, "wait_ready", return_value="READY"), \
+             patch.object(hub.shutil, "which", side_effect=lambda command: "/bin/" + command):
+            call(*args, **kwargs)
+        return sent
+
+    def rollout(self, home, report_id):
+        """A saved Codex session whose first user message carries the helper's brief."""
+        session = "33333333-3333-3333-3333-333333333333"
+        day = Path(home) / "sessions/2026/10/30"
+        day.mkdir(parents=True, exist_ok=True)
+        (day / f"rollout-2026-10-30T13-00-00-{session}.jsonl").write_text(
+            json.dumps({"payload": {"role": "user", "content": "done " + report_id}}) + "\n")
+        return session
+
+    def test_resume_keeps_the_saved_kind_and_account_after_its_profile_changes(self):
+        saved, edited = str(self.root / "saved"), str(self.root / "edited")
+        work = f'[profiles.work]\nkind="codex"\ncommand="codex-work"\nhome={json.dumps(saved)}\n'
+        self.config.write_text(work)
+        self.launched(hub.spawn_agent, "work", "helper", self.temp.name, "task", visible=False)
+        session = self.rollout(saved, hub.load_record("helper")["report_id"])
+        for config, command in ((work.replace(saved, edited), "codex-work"),  # home edited: same command
+                                ("[profiles]\n", "codex"),  # removed: the kind's default command
+                                ('[profiles.work]\nkind="claude"\n', "codex")):  # name reused for another kind
+            with self.subTest(config=config):
+                self.config.write_text(config)
+                sent = self.launched(hub.resume_agent, "helper", visible=False)
+                self.assertEqual((sent["kind"], sent["profile"]), ("codex", "work"))
+                self.assertEqual(sent["argv"][:3], ["/bin/" + command, "resume", session])
+                self.assertEqual(sent["env"]["CODEX_HOME"], saved)
+                self.assertEqual(hub.load_record("helper")["home"], saved)
+
+    def test_resume_reuses_the_home_the_helper_ran_with_not_the_callers(self):
+        caller = str(self.root / "caller")
+        native = {"codex": str(self.root / ".codex"), "claude": None}  # Claude's native default sets nothing
+        with patch.object(hub, "HOME", str(self.root)):
+            for kind, variable in (("codex", "CODEX_HOME"), ("claude", "CLAUDE_CONFIG_DIR")):
+                for inherited in (str(self.root / "spawner"), None):
+                    with self.subTest(kind=kind, inherited=inherited), patch.dict(os.environ):
+                        os.environ.pop(variable, None)
+                        os.environ.update({variable: inherited} if inherited else {})
+                        self.launched(hub.spawn_agent, kind, "helper", self.temp.name, "task", visible=False)
+                        home = inherited or native[kind]
+                        self.assertEqual(hub.load_record("helper")["home"], home)
+                        if kind == "codex":
+                            session = self.rollout(home, hub.load_record("helper")["report_id"])
+                        os.environ[variable] = caller
+                        with patch.dict(hub.CODEX_HOMES, codex=caller):
+                            sent = self.launched(hub.resume_agent, "helper", visible=False)
+                        self.assertEqual(sent["env"].get(variable), home)
+                        if kind == "codex":
+                            self.assertEqual(sent["argv"][1:3], ["resume", session])
+
+    def test_records_without_profile_or_home_resume_as_before(self):
+        caller = str(self.root / "caller")
+        self.config.write_text('[profiles.codex]\ncommand="codex-current"\n')
+        session = self.rollout(caller, "r1")
+        # Saved before profiles, and before the record held the home the helper ran with.
+        for extra in ({}, {"profile": "codex", "home": ""}):
+            with self.subTest(extra=extra):
+                hub.save_record({"name": "legacy", "kind": "codex", "session_id": "", "report_id": "r1",
+                                 "cwd": self.temp.name, "model": "", "effort": "", "started": time.time(),
+                                 "task": "t", **extra})
+                with patch.dict(os.environ, CODEX_HOME=caller), patch.dict(hub.CODEX_HOMES, codex=caller):
+                    sent = self.launched(hub.resume_agent, "legacy", visible=False)
+                self.assertEqual(sent["argv"][:3], ["/bin/codex-current", "resume", session])
+                self.assertEqual((sent["profile"], sent["env"]["CODEX_HOME"]), ("codex", caller))
 
     def test_profile_settings_restore_leaves_other_account_untouched(self):
         first = self.root / "first.json"

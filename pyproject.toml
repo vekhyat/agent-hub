@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-hub"
-version = "0.1.0"
-description = "Drive interactive coding agents in visible Foot terminals"
+version = "0.2.0"
+description = "Drive interactive coding agents and named accounts in visible terminals"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"

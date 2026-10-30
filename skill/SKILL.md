@@ -1,11 +1,13 @@
 ---
 name: agent-hub
-description: Start and control other coding agents in visible Foot terminals when the user requests cross-agent work or agent-hub.
+description: Start and control coding agents and named account profiles in visible terminals when the user requests cross-agent work or agent-hub.
 ---
 
 Run `agent-hub --help` for commands. The executable must be on the caller's PATH and works from any project.
 
-Launch kinds: `claude`, `codex1`, `codex2`, `opencode`, `grok`. Choose the requested Codex account explicitly. Each launcher retains its own login and settings.
+Run `agent-hub profiles` to find built-in and configured account profiles. Choose the account requested by the user. Named Claude and Codex profiles select their own configuration directory. Existing `codex1` and `codex2` launchers remain supported.
+
+Use `spawn --terminal ghostty` or `--terminal kitty` when the user requests a terminal. Otherwise the hub selects an available supported terminal. `AGENT_HUB_TERMINAL` sets the caller's default.
 
 Every `spawn` requires `--cwd /path/to/project`. Select the directory required by the task. The hub rejects missing or nonexistent directories and resolves symlinks before launch. Then use `ask`, `read`, `wait`, `keys`, `model`, and `kill` as needed. `wait` reports quiet screens, including permission dialogs and errors. Check the reply before treating a task as done. Use `read --lines 100` for longer output.
 

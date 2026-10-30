@@ -1,5 +1,9 @@
 # Set up Codex account launchers
 
+For new account setups, [named profiles](accounts.md) use any number of Claude
+or Codex accounts without wrapper scripts. This page covers existing
+`codex1` and `codex2` launchers.
+
 The hub calls executable commands named `codex1` and `codex2`. Each command must
 launch interactive Codex with its own `CODEX_HOME`. Shell aliases and functions
 are not executables and cannot be launched by the hub.

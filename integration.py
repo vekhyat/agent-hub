@@ -1,10 +1,11 @@
-"""Private-daemon integration checks. Real PTYs/systemd/Foot; no model requests."""
+"""Private-daemon integration checks. Real PTYs/systemd/terminals; no model requests."""
 import contextlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -64,14 +65,15 @@ else:
             time.sleep(.03)
         self.fail('condition did not become true')
 
-    def spawn(self,name,code,visible=False):
+    def spawn(self,name,code,visible=False,terminal='auto',workspace='special:agent-hub-integration',parent=''):
         result=self.h.request('spawn',name=name,kind='claude',argv=[sys.executable,'-c',code],
-                              cwd=self.tmp.name,env=dict(os.environ),depth=0,parent='',visible=visible)
+                              cwd=self.tmp.name,env=dict(os.environ),depth=0,parent=parent,visible=visible,terminal=terminal,
+                              workspace=workspace)
         name=result['name']
         self.wait_for(lambda:'READY' in self.h.request('screen',name=name,lines=30)['text'])
         return name
 
-    def test_daemon_survives_first_caller_scope_and_keeps_foot_viewer(self):
+    def test_daemon_survives_first_caller_scope_and_keeps_viewer(self):
         proc=subprocess.Popen(['systemd-run','--user','--scope','--quiet','--unit='+self.caller_unit,
                                sys.executable,str(self.entry),'first-caller'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
         self.processes.append(proc)
@@ -150,6 +152,101 @@ def leave(*args):
                 path=Path(f'/proc/{child}/stat')
                 self.wait_for(lambda:not path.exists() or path.read_text().rsplit(')',1)[1].split()[0]=='Z')
                 self.assertFalse(self.h.request('info',name=name)['alive'])
+
+
+    def test_each_installed_terminal_attaches_and_closes(self):
+        available = [name for name in self.h.TERMINALS if shutil.which(name)
+                     and (name != 'foot' or os.environ.get('WAYLAND_DISPLAY'))]
+        if not available:
+            self.skipTest('no supported terminal installed')
+        for terminal in available:
+            with self.subTest(terminal=terminal):
+                before = json.loads(self.h.hyprland_request(['-j', 'activewindow'], dict(os.environ))) if os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') else None
+                name = self.spawn('viewer-' + terminal, "import time;print('READY',flush=True);time.sleep(60)",
+                                  visible=True, terminal=terminal)
+                self.assertEqual(self.h.request('list')['agents'][0]['viewers'], 1)
+                if before is not None:
+                    token = 'agent-hub-' + self.h.hashlib.sha256(b'special:agent-hub-integration').hexdigest()[:16]
+                    windows = [w for w in self.h.hyprland_clients(dict(os.environ)) if w['initialTitle'] == token]
+                    self.assertEqual(len(windows), 1)
+                    self.assertEqual(windows[0]['workspace']['name'], 'special:agent-hub-integration')
+                    after = json.loads(self.h.hyprland_request(['-j', 'activewindow'], dict(os.environ)))
+                    self.assertEqual(after.get('address'), before.get('address'), 'helper stole focus')
+                self.h.request('kill', name=name)
+                self.assertFalse(self.h.request('info', name=name)['alive'])
+
+    @unittest.skipUnless(os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') and shutil.which('foot'), 'needs Hyprland and Foot')
+    def test_nested_helper_follows_moved_parent_without_taking_focus(self):
+        env = dict(os.environ)
+        before = json.loads(self.h.hyprland_request(['-j', 'activewindow'], env))
+        code = "import time;print('READY',flush=True);time.sleep(60)"
+        parent = self.spawn('workspace-parent', code, visible=True, terminal='foot')
+        token = 'agent-hub-' + self.h.hashlib.sha256(b'special:agent-hub-integration').hexdigest()[:16]
+        window = next(w for w in self.h.hyprland_clients(env) if w['initialTitle'] == token)
+        moved = 'special:agent-hub-moved'
+        reply = self.h.hyprland_request(['eval', 'hl.dispatch(hl.dsp.window.move({window=' +
+            json.dumps('address:' + window['address']) + ',workspace=' + json.dumps(moved) + ',follow=false}))'], env)
+        self.assertEqual(reply, 'ok')
+        child = self.spawn('workspace-child', code, visible=True, terminal='foot', parent=parent)
+        self.assertEqual(self.h.request('info', name=child)['workspace'], moved)
+        child_token = 'agent-hub-' + self.h.hashlib.sha256(moved.encode()).hexdigest()[:16]
+        child_window = next(w for w in self.h.hyprland_clients(env) if w['initialTitle'] == child_token)
+        self.assertEqual(child_window['workspace']['name'], moved)
+        after = json.loads(self.h.hyprland_request(['-j', 'activewindow'], env))
+        self.assertEqual(after.get('address'), before.get('address'), 'nested helper stole focus')
+        self.h.request('kill', name=parent)
+
+    @unittest.skipUnless(os.environ.get('HYPRLAND_INSTANCE_SIGNATURE') and shutil.which('foot'), 'needs Hyprland and Foot')
+    def test_terminal_caller_is_found_on_an_inactive_workspace(self):
+        report = self.root / 'origin'
+        script = self.root / 'origin.py'
+        script.write_text('import os,sys,time\nsys.path.insert(0,' + repr(str(Path(installed.__file__).parent)) +
+                          ')\nimport agent_hub as h\nopen(' + repr(str(report)) +
+                          ',"w").write(h.caller_workspace(dict(os.environ)))\ntime.sleep(60)\n')
+        env = dict(os.environ)
+        env.pop('AGENT_HUB_WORKSPACE', None)
+        terminal = self.h.background_terminal(self.h.terminal_command('foot', env), 'special:agent-hub-origin', env)
+        proc = subprocess.Popen([*terminal, sys.executable, str(script)], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.processes.append(proc)
+        self.wait_for(lambda: report.exists() and bool(report.read_text()))
+        self.assertEqual(report.read_text(), 'special:agent-hub-origin')
+
+    def test_named_accounts_reach_real_children_and_keep_their_identity(self):
+        from unittest.mock import patch
+        launcher = self.root / 'fake-agent'
+        launcher.write_text('#!' + sys.executable + '\n' + '''import json,os,time
+print('\\x1b[?2004hREADY',flush=True)
+for key,value in [('cwd',os.getcwd()),('claude',os.getenv('CLAUDE_CONFIG_DIR')),('codex',os.getenv('CODEX_HOME'))]:
+    print(key+'='+str(value),flush=True)
+time.sleep(60)
+''')
+        launcher.chmod(0o700)
+        profiles = self.root / 'profiles.toml'
+        entries = []
+        for kind in ('claude', 'codex'):
+            for account in ('first', 'second'):
+                name = kind + '-' + account
+                entries.append(f'[profiles.{name}]\nkind="{kind}"\ncommand={json.dumps(str(launcher))}\nhome={json.dumps(str(self.root/name))}\n')
+        profiles.write_text('\n'.join(entries))
+        with patch.dict(os.environ, {'AGENT_HUB_PROFILES':str(profiles)}):
+            for kind in ('claude', 'codex'):
+                for account in ('first', 'second'):
+                    name = kind + '-' + account
+                    self.h.spawn_agent(name, name, self.tmp.name, visible=False)
+                    info = self.h.request('info', name=name)
+                    screen = self.h.request('screen', name=name, lines=30)['text']
+                    self.assertEqual(info['profile'], name)
+                    self.assertEqual(info['kind'], kind)
+                    self.assertIn(str(self.root/name), screen)
+                    self.assertIn(self.tmp.name, screen)
+                    if kind == 'claude':
+                        self.assertEqual(info['settings_file'], str(self.root/name/'settings.json'))
+            self.assertEqual({s['profile'] for s in self.h.request('list')['agents']},
+                             {'claude-first','claude-second','codex-first','codex-second'})
+            for name in ('claude-first','claude-second','codex-first','codex-second'):
+                self.h.request('kill', name=name)
+                self.assertEqual(self.h.request('info', name=name)['profile'], name)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

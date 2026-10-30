@@ -8,12 +8,16 @@ One file, three roles:
   agent_hub.py ls | kill N human helpers
 
 The daemon keeps a pyte screen per agent so other agents can read what it shows,
-and streams raw output to attached Foot windows.
+and streams raw output to attached terminal windows.
 
 CLI only: no MCP registration, SDK, loaded tool schemas or per-agent server.
 The daemon exits when no sessions remain for 10 seconds.
 
 Agents see only helpers owned by their conversation or standalone CLI process.
+Helpers report back with `agent-hub tell` and `agent-hub done`; `done` closes them. Spawners
+collect reports with `agent-hub wait`. Forgotten idle helpers are closed after AGENT_HUB_MAX_IDLE.
+`agent-hub resume` reopens a closed helper with its conversation.
+
 Humans, through `attach`, `ls` and `kill`, can reach every agent. Any process running as
 this user can still talk to the socket directly; this is not a security boundary.
 """
@@ -22,12 +26,14 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import glob
 import hashlib
 import shutil
 import json
 import os
 import re
 import select
+import shlex
 import signal
 import socket
 import struct
@@ -47,18 +53,134 @@ SETTINGS_LOCK = os.path.join(RUNTIME, "agent-hub-settings.lock")
 IDLE_SECONDS = 10
 TERMINATE_GRACE = 3
 VIEWER_TIMEOUT = 8
+DONE_GRACE = 2  # lets `agent-hub done` return before its own session closes
+MAX_REPORT = 32 * 1024
+REPORT_TTL = 3600  # unread helper reports are dropped after this long
+BLOCKED_AFTER = 30  # a quiet helper that has not reported by then is likely on a dialog
 WARNINGS: list[str] = []
 DEPTH = int(os.environ.get("AGENT_HUB_DEPTH", "0"))
 PARENT = os.environ.get("AGENT_HUB_NAME", "")  # set when this process runs inside a hub agent
 MAX_DEPTH = int(os.environ.get("AGENT_HUB_MAX_DEPTH", "2"))
 MAX_AGENTS = int(os.environ.get("AGENT_HUB_MAX_AGENTS", "8"))
-TERMINAL = ["foot"]
+MAX_IDLE = int(os.environ.get("AGENT_HUB_MAX_IDLE", "1800"))  # close forgotten helpers; 0 disables
+TERMINALS = {
+    "foot": ["foot"],
+    "ghostty": ["ghostty", "--gtk-single-instance=false", "-e"],
+    "kitty": ["kitty"],
+    "alacritty": ["alacritty", "-e"],
+    "wezterm": ["wezterm", "start", "--always-new-process", "--"],
+    "xterm": ["xterm", "-e"],
+}
+
+
+def terminal_command(choice: str = "", env: dict | None = None) -> list[str]:
+    env = os.environ if env is None else env
+    choice = choice or env.get("AGENT_HUB_TERMINAL") or "auto"
+    if choice != "auto" and choice not in TERMINALS:
+        raise ValueError(f"unknown terminal {choice!r}; choose auto or {', '.join(TERMINALS)}")
+    for name in TERMINALS if choice == "auto" else [choice]:
+        if choice == "auto" and name == "foot" and not env.get("WAYLAND_DISPLAY"):
+            continue
+        command, *args = TERMINALS[name]
+        binary = shutil.which(command, path=env.get("PATH", os.defpath))
+        if binary:
+            return [binary, *args]
+    raise ValueError(f"terminal {choice!r} is not available; install a supported terminal or use --no-window")
+
+
 def process_start(pid: int) -> str | None:
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[19]
     except (OSError, IndexError):
         return None
+
+
+def hyprland_request(args: list[str], env: dict) -> str:
+    try:
+        result = subprocess.run(["hyprctl", *args], env=env, capture_output=True,
+                                text=True, timeout=3, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(f"cannot place agent terminal through Hyprland: {error}") from error
+    if result.returncode:
+        raise RuntimeError("cannot place agent terminal through Hyprland: " +
+                           (result.stderr or result.stdout).strip())
+    return result.stdout.strip()
+
+
+def hyprland_clients(env: dict) -> list[dict]:
+    try:
+        clients = json.loads(hyprland_request(["-j", "clients"], env))
+        if isinstance(clients, list):
+            return clients
+    except ValueError:
+        pass
+    raise RuntimeError("Hyprland returned an invalid window list")
+
+
+def window_workspace(window: dict) -> str:
+    workspace = window.get("workspace", {})
+    number = workspace.get("id", 0)
+    name = workspace.get("name", "")
+    if number > 0:
+        return str(number)
+    return name if name.startswith("special:") else "name:" + name if name else ""
+
+
+def process_workspace(clients: list[dict], pid: int, viewer: bool = False) -> str:
+    """Match process ancestry, never the currently focused window."""
+    windows = {window["pid"]: window for window in clients if window.get("mapped", True)}
+    for start in windows if viewer else [pid]:
+        current, seen = start, set()
+        while current > 1 and current not in seen:
+            seen.add(current)
+            if (viewer and current == pid) or (not viewer and current in windows):
+                return window_workspace(windows[start if viewer else current])
+            try:
+                with open(f"/proc/{current}/stat") as stream:
+                    current = int(stream.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                break
+    return ""
+
+
+def caller_workspace(env: dict) -> str:
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return ""
+    return (process_workspace(hyprland_clients(env), os.getpid()) or
+            env.get("AGENT_HUB_WORKSPACE", ""))
+
+
+def background_terminal(terminal: list[str], workspace: str, env: dict) -> list[str]:
+    if not env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return terminal
+    if not workspace:
+        raise RuntimeError("cannot locate the spawning agent's Hyprland window; "
+                           "set AGENT_HUB_WORKSPACE to its workspace or use --no-window")
+    if not re.fullmatch(r"(?:[1-9][0-9]*|(?:name|special):[^\x00-\x1f]+)", workspace):
+        raise ValueError("AGENT_HUB_WORKSPACE must be a workspace number, name:NAME, or special:NAME")
+    token = "agent-hub-" + hashlib.sha256(workspace.encode()).hexdigest()[:16]
+    name = os.path.basename(terminal[0])
+    # WezTerm exposes --class on start; the others can retain their normal app ID.
+    prop = "initial_class" if name == "wezterm" else "initial_title"
+    code = ("hl.window_rule({name=" + json.dumps(token + "-" + prop) +
+            ",match={" + prop + "=" + json.dumps("^" + token + "$") + "},workspace=" +
+            json.dumps(workspace + " silent", ensure_ascii=False) + ",no_initial_focus=true})")
+    reply = hyprland_request(["eval", code], env)
+    if reply != "ok":
+        raise RuntimeError("cannot set background terminal rule (requires Hyprland 0.56+): " + reply)
+    options = {
+        "foot": ["--title=" + token], "ghostty": ["--title=" + token],
+        "kitty": ["--title", token], "alacritty": ["--title", token],
+        "wezterm": ["--class", token], "xterm": ["-T", token],
+    }
+    index = 2 if name == "wezterm" else 1
+    return [*terminal[:index], *options[name], *terminal[index:]]
+
+
+def helper_brief(report_id: str, keep: bool, hub: str = "") -> str:
+    return (HELPER_BRIEF.format(hub=hub or HUB_COMMAND, id=report_id) +
+            ("." if keep else "; it delivers the result and closes this session."))
 
 
 def caller_owner() -> str | None:
@@ -87,7 +209,7 @@ def caller_owner() -> str | None:
                         raise RuntimeError("Codex app-server requires a conversation ID (CODEX_THREAD_ID or AGENT_HUB_CALLER_ID)")
                 suffix = ":" + hashlib.sha256(context.encode()).hexdigest()[:24] if context else ""
                 return f"proc:{pid}:{stat[19]}{suffix}"
-            if executable in {"foot", "footclient", "ghostty", "kitty", "alacritty", "konsole", "wezterm-gui"}:
+            if executable in {*TERMINALS, "footclient", "konsole", "wezterm-gui"}:
                 terminal = fallback is None
             elif fallback is None and executable not in {"bash", "sh", "zsh", "fish", "dash", "env", "timeout", "setsid"}:
                 fallback = (pid, stat[19])
@@ -121,25 +243,41 @@ INCOMPLETE_ESC = re.compile(rb"\x1b(?:[P_\]][^\x07\x1b]*\x1b?|\[[\x30-\x3f]*[\x2
 # kind -> (argv, how to pass an initial prompt). "--" / "=" keep a prompt from parsing as a flag.
 INTERACTIVE = {
     "claude": (["claude"], lambda p: ["--", p]),
-    "codex1": (["codex1"], lambda p: ["--", p]),
-    "codex2": (["codex2"], lambda p: ["--", p]),
+    "codex": (["codex"], lambda p: ["--", p]),
     "opencode": (["opencode", "--standalone"], lambda p: [f"--prompt={p}"]),
     "grok": (["grok"], lambda p: ["--", p]),
 }
+# kind -> (args naming a new session, args reopening one). Codex names its own sessions.
+SESSION_ARGS = {
+    "claude": (lambda i: ["--session-id", i], lambda i: ["--resume", i]),
+    "codex": (lambda i: [], lambda i: ["resume", i]),
+    "opencode": (lambda i: ["--session", i], lambda i: ["--session", i]),
+    "grok": (lambda i: ["--session-id", i], lambda i: ["--resume", i]),
+}
+HELPER_RECORDS = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+                              "agent-hub/helpers")
+MAX_RECORDS = 200
 AGENT_PROCESS_NAMES = set(INTERACTIVE) | {"codex", "pi", "agy", "gemini", "cursor-agent", "amp", "t3"}
 CODEX_HOMES = {
-    "codex1": os.path.expanduser(os.environ.get("AGENT_HUB_CODEX1_HOME", "~/.codex")),
-    "codex2": os.path.expanduser(os.environ.get("AGENT_HUB_CODEX2_HOME", "~/.codex2")),
+    "codex": os.path.expanduser(os.environ.get("CODEX_HOME", "~/.codex")),
 }
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._:/#@\[\]-]{1,100}")  # model / effort / flag values
 # Lowercase text each TUI shows near the bottom only while it is busy generating / running tools.
 BUSY_MARKERS = {
     "claude": ["esc to interrupt"],
-    "codex1": ["esc to interrupt"],
-    "codex2": ["esc to interrupt"],
+    "codex": ["esc to interrupt"],
     "grok": ["ctrl+c:cancel"],
     "opencode": ["esc interrupt", "esc to interrupt"],
 }
+# Spelled out in the prompt because Codex runs shell commands from a shared server without this session's env.
+HELPER_BRIEF = ("\n\n[agent-hub] REQUIRED: another agent gave you this task and cannot see your chat replies. "
+                "To reach it you must run a shell command. To ask a question, run "
+                "`{hub} tell {id} \"<message>\"` and end your turn; the reply arrives as your next message. "
+                "Your final action, even for a trivial task, must be running `{hub} done {id} \"<your full answer>\"`")
+# Absolute, because helpers run it from shells that may not share the caller's PATH.
+HUB_ARGV = ([shutil.which("agent-hub")] if shutil.which("agent-hub")
+            else [sys.executable, os.path.abspath(__file__)])
+HUB_COMMAND = shlex.join(HUB_ARGV)
 BUSY_SCAN_LINES = 10  # only the status area: an old marker higher in scrollback must not count
 # Variables a parent agent sets that make a nested agent think it is a child/tool process.
 PARENT_ENV = re.compile(r"^(CLAUDECODE|CLAUDE_CODE_|CLAUDE_PID$|CLAUDE_EFFORT$|CODEX_(THREAD|SANDBOX|SESSION)"
@@ -160,6 +298,65 @@ MODEL_DEFAULTS_FILE = {
     "opencode": os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")),
                              "opencode/model.json"),
 }
+
+
+def load_profiles() -> dict[str, dict[str, str]]:
+    """Read user-defined account profiles only when a CLI operation needs them."""
+    profiles = {name: {"kind": "codex" if name in CODEX_HOMES else name,
+                       "command": argv[0], "home": ""}
+                for name, (argv, _) in INTERACTIVE.items()}
+    path = os.path.expanduser(os.environ.get("AGENT_HUB_PROFILES") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+        "agent-hub", "profiles.toml"))
+    try:
+        with open(path, "rb") as f:
+            import tomllib
+            document = tomllib.load(f)
+    except FileNotFoundError:
+        if os.environ.get("AGENT_HUB_PROFILES"):
+            raise ValueError(f"profiles file does not exist: {path}") from None
+        return profiles
+    except ValueError as e:
+        raise ValueError(f"invalid profiles file {path}: {e}") from e
+    configured = document.get("profiles", {})
+    if set(document) != {"profiles"} or not isinstance(configured, dict):
+        raise ValueError(f"{path}: expected [profiles.NAME] tables")
+    for name, values in configured.items():
+        label = f"{path}: profile {name!r}"
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
+            raise ValueError(f"{label}: use letters, digits, underscores or hyphens")
+        if not isinstance(values, dict) or set(values) - {"kind", "command", "home"}:
+            raise ValueError(f"{label}: expected kind, command and optional home")
+        base = profiles.get(name, {})
+        kind = values.get("kind", base.get("kind"))
+        if kind not in ("claude", "codex", "grok", "opencode"):
+            raise ValueError(f"{label}: kind must be claude, codex, grok or opencode")
+        command = values.get("command", base.get("command", kind) if kind == base.get("kind") else kind)
+        home = values.get("home", base.get("home", ""))
+        if not isinstance(command, str) or not command or command.startswith("-") or "\0" in command:
+            raise ValueError(f"{label}: command must be one executable name or path")
+        if not isinstance(home, str) or "\0" in home:
+            raise ValueError(f"{label}: home must be a directory path")
+        if home:
+            home = os.path.expanduser(home)
+            if kind not in ("claude", "codex") or not os.path.isabs(home):
+                raise ValueError(f"{label}: home needs an absolute or ~/ path for Claude or Codex")
+        profiles[name] = {"kind": kind, "command": os.path.expanduser(command), "home": home}
+    return profiles
+
+
+def get_profile(name: str) -> dict[str, str]:
+    profiles = load_profiles()
+    if name not in profiles:
+        raise ValueError(f"unknown profile {name!r}; use agent-hub profiles")
+    return profiles[name]
+
+
+def list_profiles() -> str:
+    return "\n".join(f"{name}\t{p['kind']}\t{p['command']}\t{p['home'] or '(native defaults)'}"
+                     for name, p in load_profiles().items())
+
+
 KEYS = {
     "Enter": "\r", "Escape": "\x1b", "Tab": "\t", "BTab": "\x1b[Z", "BSpace": "\x7f", "Space": " ",
     "Up": "\x1b[A", "Down": "\x1b[B", "Right": "\x1b[C", "Left": "\x1b[D",
@@ -422,6 +619,11 @@ class Session:
     def __init__(self, name, kind, argv, cwd, env, owner, depth, cols=120, rows=36):
         import pyte
         self.name, self.kind, self.cwd, self.owner, self.depth = name, kind, cwd, owner, depth
+        self.profile = kind
+        self.settings_file = MODEL_DEFAULTS_FILE.get(kind)
+        if kind == "claude":
+            directory = os.path.expanduser(env.get("CLAUDE_CONFIG_DIR") or os.path.join(HOME, ".claude"))
+            self.settings_file = os.path.normpath(os.path.join(cwd, directory, "settings.json"))
         self.parent = ""
         self.screen = pyte.HistoryScreen(cols, rows, history=200)
         self.stream = pyte.ByteStream(self.screen)
@@ -432,6 +634,14 @@ class Session:
         self.exit_status = None
         self.kill_task = None
         self.viewer_process = None
+        self.workspace = ""
+        self.terminal_argv = []
+        self.keep = False
+        self.briefed = False
+        self.report_id = ""
+        self.reported = False  # told its spawner something during this turn
+        self.announced = 0.0  # last_output when `wait` last showed this helper as quiet
+        self.hub = ""  # the spawner's agent-hub command, for briefs sent from the daemon
         self.cgroup = None
         self.master, slave = os.openpty()
         try:
@@ -594,6 +804,8 @@ class Session:
         self.exit_status = await asyncio.to_thread(self.proc.wait)
         await asyncio.sleep(0)
         self._close_pty()
+        if natural:
+            add_report(self, f"exited with status {self.exit_status}", compact(self.render(20)))
         self._close_viewers(f"[{self.name} exited with status {self.exit_status}]" if natural else f"[{self.name} killed]")
         if self.viewer_process and self.viewer_process.poll() is None:
             with contextlib.suppress(ProcessLookupError):
@@ -604,6 +816,7 @@ class Session:
         directory = archive_directory()
         os.makedirs(directory, mode=0o700, exist_ok=True)
         item = {"name": self.name, "owner": self.owner, "kind": self.kind, "cwd": self.cwd,
+                "profile": self.profile, "settings_file": self.settings_file,
                 "alive": False, "status": self.exit_status, "quiet_for": 0, "paste_mode": False,
                 "text": self.render(236), "saved_at": time.time()}
         fd, temporary = tempfile.mkstemp(dir=directory)
@@ -621,6 +834,7 @@ class Session:
 
 
 SESSIONS = {}
+REPORTS = []  # helper messages not yet read by their spawner
 IDLE_HANDLE = None
 STOP_EVENT = None
 
@@ -644,8 +858,17 @@ def reset_idle():
 
 
 def stop_if_empty():
-    if not SESSIONS and STOP_EVENT is not None:
+    if not SESSIONS and not REPORTS and STOP_EVENT is not None:
         STOP_EVENT.set()
+
+
+def by_report_id(report_id):
+    return next((s for s in SESSIONS.values() if s.report_id == report_id), None)
+
+
+def add_report(session, title, text=""):
+    REPORTS.append({"owner": session.owner, "name": session.name, "title": title,
+                    "text": text, "time": time.time()})
 
 
 async def finish_session(session):
@@ -672,8 +895,9 @@ def get(req):
 async def open_viewer(session, env):
     with tempfile.TemporaryFile() as diagnostics:
         viewer_env = dict(env, AGENT_HUB_VIEW_OWNER=json.dumps(session.owner))
+        terminal = session.terminal_argv or terminal_command(env=env)
         session.viewer_process = subprocess.Popen(
-            [*TERMINAL, sys.executable, os.path.abspath(__file__), "attach", session.name],
+            [*terminal, sys.executable, os.path.abspath(__file__), "attach", session.name],
             env=viewer_env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=diagnostics, start_new_session=True)
         deadline = time.monotonic() + VIEWER_TIMEOUT
@@ -681,7 +905,7 @@ async def open_viewer(session, env):
             if session.viewer_process.poll() is not None or time.monotonic() >= deadline:
                 diagnostics.seek(0)
                 detail = diagnostics.read(2000).decode(errors="replace").strip()
-                raise RuntimeError("Foot terminal viewer failed to attach" + (": " + detail if detail else ""))
+                raise RuntimeError(os.path.basename(terminal[0]) + " terminal viewer failed to attach" + (": " + detail if detail else ""))
             await asyncio.sleep(.02)
 
 
@@ -694,6 +918,9 @@ async def dispatch(req):
             raise ValueError("use " + ", ".join(INTERACTIVE))
         cwd = project_directory(req.get("cwd", ""))
         name = req["name"]
+        open_helper = next((s for s in SESSIONS.values() if req.get("previous") and s.report_id == req["previous"]), None)
+        if open_helper is not None:
+            raise ValueError(f"{open_helper.name!r} is still open; send it a message instead of resuming it")
         if name in SESSIONS:
             if req.get("owner") == SESSIONS[name].owner:
                 raise ValueError(f"an agent named {name!r} already exists")
@@ -707,21 +934,67 @@ async def dispatch(req):
         if len(SESSIONS) >= MAX_AGENTS:
             raise ValueError(f"{MAX_AGENTS} agents are already running; kill one first")
         env = dict(req["env"], PWD=cwd, AGENT_HUB_NAME=name, AGENT_HUB_DEPTH=str(depth))
+        workspace = req.get("workspace", env.get("AGENT_HUB_WORKSPACE", ""))
+        if env.get("HYPRLAND_INSTANCE_SIGNATURE") and parent:
+            workspace = (process_workspace(hyprland_clients(env), parent.viewer_process.pid, viewer=True)
+                         if parent.viewer_process and parent.viewer_process.poll() is None else "") or parent.workspace
+        if workspace:
+            env["AGENT_HUB_WORKSPACE"] = workspace
+        terminal = terminal_command(req.get("terminal", ""), env) if req.get("visible", False) else []
+        if terminal:
+            terminal = background_terminal(terminal, workspace, env)
         session = Session(name, req["kind"], req["argv"], cwd, env, req.get("owner"), depth)
+        session.terminal_argv = terminal
+        session.workspace = workspace
+        session.profile = req.get("profile", req["kind"])
+        session.keep = req.get("keep", False)
+        session.briefed = req.get("briefed", False)
+        session.report_id = req.get("report_id", "")
+        session.hub = req.get("hub", "")
         session.parent = parent.name if parent else ""
         SESSIONS[name] = session
         reset_idle()
         try:
             if req.get("visible", False):
                 await open_viewer(session, env)
-        except (OSError, RuntimeError):
+        except (OSError, RuntimeError, ValueError):
             await session.kill()
             raise
-        return {"name": name}
+        return {"name": name, "profile": session.profile, "workspace": session.workspace}
     if op == "list":
         return {"agents": [{"name": s.name, "kind": s.kind, "alive": s.alive, "status": s.exit_status,
-                             "cwd": s.cwd, "viewers": len(s.viewers)}
+                             "profile": s.profile, "cwd": s.cwd, "workspace": s.workspace, "viewers": len(s.viewers),
+                             "busy": shows_busy(s.kind, s.render(60)), "quiet_for": time.time() - s.last_output}
                             for s in SESSIONS.values() if req.get("owner") in (None, s.owner)]}
+    if op == "report":
+        # Sent from inside a helper, whose owner differs from its spawner's.
+        s = by_report_id(req["id"])
+        if s is None:
+            raise KeyError(f"no running helper with ID {req['id']!r}")
+        if len(req["text"]) > MAX_REPORT:
+            raise ValueError(f"report exceeds {MAX_REPORT} characters; write it to a file and report the path")
+        s.reported = True
+        if not req.get("done"):
+            add_report(s, "says", req["text"])
+        elif s.keep:
+            add_report(s, "done; still open", req["text"])
+        else:
+            add_report(s, "done; closed", req["text"])
+            asyncio.get_running_loop().call_later(DONE_GRACE, s.kill)
+        return {}
+    if op == "turn_end":
+        s = by_report_id(req["id"])
+        if s and not s.reported:
+            add_report(s, "ended its turn without reporting", req["text"] or compact(s.render(20)))
+        if s:
+            s.reported = False
+        return {}
+    if op == "reports":
+        mine = [r for r in REPORTS if req.get("owner") in (None, r["owner"])
+                and req.get("name") in (None, r["name"])]
+        REPORTS[:] = [r for r in REPORTS if r not in mine]
+        reset_idle()
+        return {"reports": mine}
     try:
         s = get(req)
     except KeyError:
@@ -731,14 +1004,23 @@ async def dispatch(req):
         return {"text": "\n".join(cached["text"].splitlines()[-req.get("lines", 80):])} if op == "screen" else cached
     if op == "info":
         return {"kind": s.kind, "alive": s.alive, "status": s.exit_status,
-                "quiet_for": time.time()-s.last_output, "paste_mode": s.paste_mode, "pid": s.proc.pid}
+                "profile": s.profile, "settings_file": s.settings_file, "workspace": s.workspace,
+                "quiet_for": time.time()-s.last_output, "paste_mode": s.paste_mode, "pid": s.proc.pid,
+                "announced": s.announced >= s.last_output}
     if op == "screen":
         return {"text": s.render(req.get("lines", 80))}
+    if op == "announce":
+        s.announced = s.last_output
+        return {}
     if op == "write":
         await s.write(req["data"].encode())
         return {}
     if op == "paste":
-        await s.paste(req["text"])
+        text = req["text"]
+        if req.get("brief") and not s.briefed:
+            s.briefed = True
+            text += helper_brief(s.report_id, s.keep, s.hub)
+        await s.paste(text)
         return {}
     if op == "kill":
         await s.kill()
@@ -776,8 +1058,10 @@ async def handle(reader, writer):
                 await serve_viewer(req, reader, writer)
                 return
             response = await dispatch(req)
-        except (KeyError, ValueError, RuntimeError, OSError, subprocess.SubprocessError) as e:
-            response = {"error": str(e).strip("'\"")}
+        except KeyError as e:  # str() of a KeyError is its quoted repr
+            response = {"error": e.args[0] if e.args else str(e)}
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as e:
+            response = {"error": str(e)}
         writer.write(frame(b"J", json.dumps(response).encode()))
         await writer.drain()
     except (asyncio.IncompleteReadError, ConnectionError, ValueError):
@@ -786,16 +1070,36 @@ async def handle(reader, writer):
         writer.close()
 
 
+def owner_alive(owner):
+    if not owner or not owner.startswith("proc:"):
+        return True
+    _, pid, started, *_ = owner.split(":")
+    return process_start(int(pid)) == started
+
+
+def forgotten(session):
+    """An automated helper left idle: no output, not working, and nothing of its own still running."""
+    return (MAX_IDLE and session.owner and not session.keep and session.kill_task is None
+            and time.time() - session.last_output >= MAX_IDLE
+            and not shows_busy(session.kind, session.render(60))
+            and not any(child.parent == session.name for child in SESSIONS.values()))
+
+
 async def watch_owners():
     while True:
         await asyncio.sleep(5)
         for session in list(SESSIONS.values()):
             if session.proc.poll() is not None and session.kill_task is None:
                 session.kill(natural=True)
-            if session.owner and session.owner.startswith("proc:"):
-                _, pid, started, *_ = session.owner.split(":")
-                if process_start(int(pid)) != started:
-                    session.kill()
+            if not owner_alive(session.owner):
+                session.kill()
+            elif forgotten(session):
+                add_report(session, f"closed after {MAX_IDLE // 60} min idle", compact(session.render(20)))
+                session.kill()
+        fresh = [r for r in REPORTS if owner_alive(r["owner"]) and time.time() - r["time"] < REPORT_TTL]
+        if len(fresh) != len(REPORTS):
+            REPORTS[:] = fresh
+            reset_idle()
 
 
 def run_daemon():
@@ -944,20 +1248,72 @@ def screen(name: str, lines: int = 20) -> str:
     return compact(request("screen", name=name, lines=lines)["text"])
 
 
+def take_reports(name: str | None = None) -> list[dict]:
+    try:
+        return request("reports", **({"name": name} if name else {}))["reports"]
+    except RuntimeError:  # no daemon, or one from before reports existed
+        return []
+
+
+def format_reports(reports: list[dict]) -> str:
+    return "\n".join(f"[{r['name']} {r['title']}]" + (f"\n{r['text']}" if r["text"] else "") for r in reports)
+
+
+def announce(name: str) -> None:
+    """Mark a quiet helper as shown, so `wait` with no name moves on to the others."""
+    with contextlib.suppress(RuntimeError):  # gone, or a daemon from before announcements
+        request("announce", name=name)
+
+
 def wait_idle(name: str, timeout: float, settle: float) -> str:
     if timeout < 0 or settle < 0:
         raise ValueError("timeout and settle must be nonnegative")
     deadline = time.monotonic() + timeout
     while True:
+        reports = take_reports(name)
+        if reports:
+            return format_reports(reports)
         info = request("info", name=name)
         text = request("screen", name=name, lines=60)["text"]
         output = "\n".join(compact(text).splitlines()[-20:])
         if not info["alive"]:
             return f"[{name} exited with status {info['status']}]\n{output}"
         if is_idle(info["kind"], text, info["quiet_for"], settle):
+            announce(name)
             return f"[{name} idle]\n{output}"
         if time.monotonic() >= deadline:
             return f"[{name} still busy after {timeout:.0f}s; use wait or read]\n{output}"
+        time.sleep(1)
+
+
+def wait_any(timeout: float, settle: float) -> str:
+    """Return on the first helper report, once every helper has gone quiet, or when one helper
+    has sat quiet without reporting for BLOCKED_AFTER seconds (a dialog, or a forgotten report)."""
+    if timeout < 0 or settle < 0:
+        raise ValueError("timeout and settle must be nonnegative")
+    deadline = time.monotonic() + timeout
+    while True:
+        reports = take_reports()
+        if reports:
+            return format_reports(reports)
+        agents = [a["name"] for a in request("list")["agents"] if a["alive"]]
+        if not agents:
+            return format_reports(take_reports()) or "no agents"
+        screens = {name: request("screen", name=name, lines=60)["text"] for name in agents}
+        infos = {name: request("info", name=name) for name in agents}
+        idle = [name for name in agents if is_idle(infos[name]["kind"], screens[name], infos[name]["quiet_for"], settle)]
+        stuck = [name for name in idle if infos[name]["quiet_for"] >= max(settle, BLOCKED_AFTER)
+                 and not infos[name].get("announced")]
+        if len(idle) == len(agents) or stuck:
+            shown = agents if len(idle) == len(agents) else stuck
+            for name in shown:
+                announce(name)
+            busy = [name for name in agents if name not in shown]
+            return "\n".join([*(f"[{name} idle]\n" + "\n".join(compact(screens[name]).splitlines()[-20:])
+                                 for name in shown),
+                               *([f"[still working: {', '.join(busy)}]"] if busy else [])])
+        if time.monotonic() >= deadline:
+            return f"[{', '.join(agents)} still busy after {timeout:.0f}s; use wait or read]"
         time.sleep(1)
 
 
@@ -979,8 +1335,8 @@ def wait_ready(name: str, kind: str, timeout: float = 30) -> str:
     return screen(name)
 
 
-def send_text(name: str, text: str, submit: bool) -> None:
-    request("paste", name=name, text=text)
+def send_text(name: str, text: str, submit: bool, brief: bool = False) -> None:
+    request("paste", name=name, text=text, brief=brief)
     if submit:
         time.sleep(0.5)
         request("write", name=name, data="\r")
@@ -1106,9 +1462,9 @@ def atomic_settings_write(path, expected, content):
 
 
 @contextlib.contextmanager
-def keep_user_default(kind, model=None, effort=None):
+def keep_user_default(kind, model=None, effort=None, path=None):
     """Restore only model fields, preserving unrelated edits and settings symlinks."""
-    path = MODEL_DEFAULTS_FILE.get(kind)
+    path = path or MODEL_DEFAULTS_FILE.get(kind)
     if not path:
         yield
         return
@@ -1203,9 +1559,10 @@ def merged_overlay(raw, updates, name):
 def switch_model(name: str, model: str, effort: str) -> str:
     check_value("model", model)
     check_value("effort", effort)
-    kind = request("info", name=name)["kind"]
+    info = request("info", name=name)
+    kind = info["kind"]
     warning_start = len(WARNINGS)
-    with keep_user_default(kind, model, effort):
+    with keep_user_default(kind, model, effort, path=info.get("settings_file")):
         if kind in ("claude", "grok"):
             for cmd in ([f"/model {model}"] if model else []) + ([f"/effort {effort}"] if effort else []):
                 run_command(name, cmd)
@@ -1235,21 +1592,116 @@ def switch_model(name: str, model: str, effort: str) -> str:
 
 
 def available_models(kind: str) -> str:
+    name = kind
+    profile = get_profile(name)
+    kind = profile["kind"]
     if kind == "claude":
         return ("aliases: opus, sonnet, haiku, fable (or full IDs like claude-opus-5-5)\n"
                 "efforts: low, medium, high, xhigh, max")
     if kind in CODEX_HOMES:
-        with open(os.path.join(CODEX_HOMES[kind], "models_cache.json")) as f:
+        home = profile["home"] or CODEX_HOMES.get(name, CODEX_HOMES["codex"])
+        with open(os.path.join(home, "models_cache.json")) as f:
             models = json.load(f)["models"]
         return "\n".join(
             f"{m['slug']}  efforts: {', '.join(r['effort'] for r in m.get('supported_reasoning_levels', []))}"
             for m in models if m.get("visibility") == "list"
         )
     if kind in ("opencode", "grok"):
-        binary = shutil.which(kind) or (os.path.join(HOME, ".opencode/bin/opencode") if kind == "opencode" else kind)
+        binary = shutil.which(profile["command"]) or (os.path.join(HOME, ".opencode/bin/opencode")
+                  if profile["command"] == "opencode" else profile["command"])
         r = subprocess.run([binary, "models"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
         return r.stdout.strip() or r.stderr.strip()
     raise ValueError(f"unknown kind {kind!r}; use one of {sorted(LAUNCH_MODEL) + ['grok', 'opencode']}")
+
+
+def new_session_id(kind: str) -> str:
+    if kind == "codex":
+        return ""
+    return "ses_" + uuid.uuid4().hex if kind == "opencode" else str(uuid.uuid4())
+
+
+def record_path(name: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        raise ValueError(f"invalid helper name {name!r}")
+    return os.path.join(HELPER_RECORDS, name + ".json")
+
+
+def load_records() -> list[dict]:
+    """Saved helpers, newest first. They outlive the daemon and reboots, unlike its screens."""
+    if not os.path.isdir(HELPER_RECORDS):
+        return []
+    paths = sorted((os.path.join(HELPER_RECORDS, p) for p in os.listdir(HELPER_RECORDS) if p.endswith(".json")),
+                   key=os.path.getmtime, reverse=True)
+    records = []
+    for path in paths:
+        with contextlib.suppress(OSError, ValueError), open(path) as f:
+            records.append(json.load(f))
+    return records
+
+
+def load_record(name: str) -> dict:
+    try:
+        with open(record_path(name)) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"no saved helper named {name!r}; see agent-hub ls --closed") from None
+
+
+def keep_closed_record(name: str) -> None:
+    """A new helper reusing a closed helper's name keeps the old one resumable as NAME-REPORTID."""
+    with contextlib.suppress(ValueError):
+        old = load_record(name)
+        if old.get("report_id"):
+            old["name"] = f"{name}-{old['report_id']}"
+            save_record(old)
+            started = old.get("started", time.time())
+            os.utime(record_path(old["name"]), (started, started))  # keeps its place in ls --closed
+
+
+def save_record(record: dict) -> None:
+    os.makedirs(HELPER_RECORDS, mode=0o700, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=HELPER_RECORDS)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(record, f)
+        os.replace(temporary, record_path(record["name"]))
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary)
+    for old in load_records()[MAX_RECORDS:]:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(record_path(old["name"]))
+
+
+def codex_session_id(record: dict) -> str:
+    """Find the rollout whose user message holds this helper's report ID; its name ends in the session ID."""
+    root = os.path.join(record.get("home") or CODEX_HOMES["codex"], "sessions")
+    for path in glob.glob(os.path.join(root, "*/*/*/rollout-*.jsonl")):
+        if os.path.getmtime(path) < record["started"] - 60:
+            continue
+        with open(path, errors="replace") as f:
+            for line in f:
+                if record["report_id"] in line and json.loads(line).get("payload", {}).get("role") == "user":
+                    return path[-len("00000000-0000-0000-0000-000000000000.jsonl"):-len(".jsonl")]
+    raise ValueError(f"cannot find {record['name']!r} in Codex's saved sessions; use `codex resume` to pick it by hand")
+
+
+def turn_hook_args(kind: str, report_id: str) -> list[str]:
+    """Per-launch hook settings; the user's own config files stay untouched."""
+    command = [*HUB_ARGV, "turn-end", report_id]
+    if kind == "claude":
+        hook = {"type": "command", "command": shlex.join(command)}
+        return ["--settings", json.dumps({"hooks": {"Stop": [{"hooks": [hook]}]}})]
+    return ["-c", "notify=" + json.dumps(command)] if kind == "codex" else []
+
+
+def daemon_outdated() -> bool:
+    """A daemon started before reports existed keeps running until its helpers exit."""
+    try:
+        request("reports", name="")
+    except RuntimeError as error:
+        return "no running agents" not in str(error)
+    return False
 
 
 def spawn_agent(
@@ -1260,17 +1712,22 @@ def spawn_agent(
     model: str = "",
     effort: str = "",
     visible: bool = True,
+    terminal: str = "",
+    keep: bool = False,
+    resume: dict | None = None,
 ) -> str:
-    """Start an interactive agent in its own terminal (a Foot window opens if visible).
+    """Start an interactive agent in its own terminal (a window opens if visible).
 
-    kind: claude | codex1 | codex2 | opencode | grok. prompt is its first message. model / effort:
+    kind: a built-in or configured profile. prompt is its first message. model / effort:
     see list_models (opencode has no effort). Waits until the agent is ready and returns its screen;
-    answer any dialog on it with send_keys.
+    answer any dialog on it with send_keys. keep stops the hub closing it on done or when idle.
+    resume is a saved helper's record; see resume_agent.
     """
     if DEPTH >= MAX_DEPTH:
         raise RuntimeError(f"agent-hub depth limit reached ({DEPTH}/{MAX_DEPTH}); do the work yourself")
-    if kind not in INTERACTIVE:
-        raise ValueError(f"unknown kind {kind!r}; use one of {', '.join(INTERACTIVE)}")
+    profile_name = kind
+    profile = get_profile(profile_name)
+    kind = profile["kind"]
     check_value("model", model)
     check_value("effort", effort)
     if kind == "opencode" and effort:
@@ -1278,20 +1735,28 @@ def spawn_agent(
     name = re.sub(r"[^A-Za-z0-9_-]", "-", name) or f"{kind}-{uuid.uuid4().hex[:4]}"
     cwd = project_directory(cwd)
     argv, prompt_args = INTERACTIVE[kind]
-    binary = shutil.which(argv[0])
+    command = profile["command"]
+    binary = shutil.which(command)
     if not binary:
-        candidate = os.path.join(HOME, ".local/bin", argv[0])
+        candidate = os.path.join(HOME, ".local/bin", command)
         binary = candidate if os.access(candidate, os.X_OK) else None
-    if not binary and kind == "opencode":
+    if not binary and command == "opencode":
         candidate = os.path.join(HOME, ".opencode/bin/opencode")
         binary = candidate if os.path.isfile(candidate) else None
     if not binary:
-        raise ValueError(f"{kind} is not installed or not on PATH")
-    argv = [binary, *argv[1:]]
-    if visible and not shutil.which("foot"):
-        raise ValueError("Foot is not installed")
+        raise ValueError(f"profile {profile_name!r}: {command!r} is not installed or not on PATH")
+    session_id = resume["session_id"] if resume else new_session_id(kind)
+    argv = [binary, *SESSION_ARGS[kind][bool(resume)](session_id), *argv[1:]]
+    if kind == "codex":  # its update dialog would swallow the first message, and Enter accepts the update
+        argv += ["-c", "check_for_update_on_startup=false"]
+    terminal = terminal or os.environ.get("AGENT_HUB_TERMINAL") or "auto"
+    if visible:
+        terminal_command(terminal)
+    workspace = caller_workspace(os.environ) if visible else os.environ.get("AGENT_HUB_WORKSPACE", "")
     context_keys = {"AGENT_HUB_CALLER_ID", "AGENT_HUB_VIEW_OWNER", "CLAUDE_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "PI_SESSION_ID", "OPENCODE_SESSION_ID"}
     env = {k: v for k, v in os.environ.items() if not PARENT_ENV.match(k) and k not in context_keys}
+    if profile["home"]:
+        env["CLAUDE_CONFIG_DIR" if kind == "claude" else "CODEX_HOME"] = profile["home"]
     env["PATH"] = os.pathsep.join(dict.fromkeys([
         *os.get_exec_path(env), os.path.join(HOME, ".local/bin"),
         os.path.join(HOME, ".local/share/mise/command-wrappers/bin"),
@@ -1308,14 +1773,48 @@ def spawn_agent(
         env["GROK_CONFIG"] = merged_overlay(env.get("GROK_CONFIG"), {"models": models}, "GROK_CONFIG")
     elif kind == "opencode" and model:
         env["OPENCODE_CONFIG_CONTENT"] = merged_overlay(env.get("OPENCODE_CONFIG_CONTENT"), {"model": model}, "OPENCODE_CONFIG_CONTENT")
-    argv = argv + (prompt_args(prompt) if prompt else [])
-    name = request("spawn", name=name, kind=kind, argv=argv, cwd=cwd, env=env, depth=DEPTH, parent=PARENT, visible=visible)["name"]
-    return f"spawned {kind} as {name!r} in {cwd}\n{wait_ready(name, kind)}"
+    outdated = daemon_outdated()
+    report_id = uuid.uuid4().hex[:8]
+    if not outdated:
+        argv = argv + turn_hook_args(kind, report_id)
+    argv = argv + (prompt_args(prompt + ("" if outdated else helper_brief(report_id, keep))) if prompt else [])
+    result = request("spawn", name=name, kind=kind, profile=profile_name, argv=argv, cwd=cwd, env=env, depth=DEPTH,
+                     parent=PARENT, visible=visible, terminal=terminal, workspace=workspace, keep=keep,
+                     briefed=bool(prompt), report_id=report_id, hub=HUB_COMMAND,
+                     previous=resume["report_id"] if resume else None)
+    name = result["name"]
+    if result.get("profile") != profile_name:
+        request("kill", name=name)
+        raise RuntimeError("running daemon does not support account profiles and terminal selection; "
+                           "close existing helpers, wait 10 seconds, and retry")
+    if not resume:
+        keep_closed_record(name)
+    save_record({"name": name, "profile": profile_name, "kind": kind, "home": profile["home"],
+                 "session_id": session_id, "report_id": report_id, "cwd": cwd,
+                 "model": model, "effort": effort, "started": time.time(),
+                 "task": prompt.split("\n")[0][:80] or (resume["task"] if resume else "")})
+    if visible and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and "workspace" not in result:
+        request("kill", name=name)
+        raise RuntimeError("running daemon does not support workspace placement; "
+                           "close existing helpers, wait 10 seconds, and retry")
+    if outdated:
+        print("warning: the running daemon predates helper reports; this helper will not report or "
+              "close itself, so kill it when finished", file=sys.stderr)
+    return f"spawned {profile_name} as {name!r} in {cwd}\n{wait_ready(name, kind)}"
+
+
+def resume_agent(name: str, prompt: str = "", model: str = "", effort: str = "",
+                 visible: bool = True, keep: bool = False) -> str:
+    """Reopen a closed helper with its conversation intact, in its original directory."""
+    record = load_record(name)
+    record["session_id"] = record["session_id"] or codex_session_id(record)
+    return spawn_agent(record.get("profile", record["kind"]), name, record["cwd"], prompt, model or record["model"],
+                       effort or record["effort"], visible, keep, resume=record)
 
 
 def send_agent(name: str, text: str, submit: bool = True) -> str:
     """Type text into an agent's prompt (multi-line safe) and press Enter unless submit is false."""
-    send_text(name, text, submit)
+    send_text(name, text, submit, brief=True)
     return "sent"
 
 
@@ -1331,7 +1830,7 @@ def set_model(name: str, model: str = "", effort: str = "") -> str:
 
 
 def list_models(kind: str) -> str:
-    """List models and efforts for claude, codex1, codex2, opencode or grok."""
+    """List models and efforts for a built-in or named account profile."""
     return available_models(kind)
 
 
@@ -1341,26 +1840,62 @@ def read_agent(name: str, lines: int = 40, raw: bool = False) -> str:
     return text if raw else compact(text)
 
 
-def wait_agent(name: str, timeout: float = 600, settle: float = 4) -> str:
-    """Block until the agent is idle (or exits / times out), then return its screen."""
-    return wait_idle(name, timeout, settle)
+def wait_agent(name: str | None, timeout: float = 600, settle: float = 4) -> str:
+    """Block until the agent reports or is idle (or exits / times out). No name: any of your agents."""
+    return wait_idle(name, timeout, settle) if name else wait_any(timeout, settle)
 
 
 def ask_agent(name: str, text: str, timeout: float = 600, settle: float = 4) -> str:
     """Send a message and wait for the agent's reply: send_agent + wait_agent."""
-    send_text(name, text, True)
+    send_text(name, text, True, brief=True)
     time.sleep(2)
     return wait_idle(name, timeout, settle)
 
 
 def list_agents() -> str:
-    """List the agents you spawned: name, kind, alive/exited, open windows, cwd."""
+    """List the agents you spawned: name, kind, state, open windows, cwd."""
+    def state(a):
+        if not a["alive"]:
+            return f"exited({a['status']})"
+        if "busy" not in a:  # a daemon from before states
+            return "alive"
+        return "busy" if a["busy"] else f"quiet {int(a['quiet_for']) // 60}m{int(a['quiet_for']) % 60:02d}s"
     agents = request("list")["agents"]
     return "\n".join(
-        f"{a['name']}\t{a['kind']}\t{'alive' if a['alive'] else f'exited({a['status']})'}\t"
-        f"{a['viewers']} window(s)\t{a['cwd']}"
+        f"{a['name']}\t{a.get('profile', a['kind'])}\t{state(a)}\t{a['viewers']} window(s)\t{a['cwd']}"
         for a in agents
     ) or "no agents"
+
+
+def list_closed() -> str:
+    """Saved helpers that can be resumed, newest first."""
+    running = {a["name"] for a in request("list")["agents"]} if os.path.exists(SOCK) else set()
+    return "\n".join(
+        f"{r['name']}\t{r['kind']}\t{time.strftime('%b %d %H:%M', time.localtime(r['started']))}\t{r['cwd']}\t{r['task']}"
+        for r in load_records() if r["name"] not in running
+    ) or "no closed helpers"
+
+
+def report(report_id: str, text: str, done: bool = False) -> str:
+    """Send a message to the agent that spawned this helper. done also ends the helper's task."""
+    request("report", id=report_id, text=text, done=done)
+    return "delivered"
+
+
+def turn_end(report_id: str, payload: str = "") -> str:
+    """Hook target for a helper's finished turn. Failures stay silent: the helper must not notice."""
+    try:
+        event = json.loads(payload or sys.stdin.read())
+        thread = event.get("thread-id")
+        # Codex also notifies for its hidden title thread, which has no saved session.
+        home = os.path.expanduser(os.environ.get("CODEX_HOME") or CODEX_HOMES["codex"])  # the helper's account
+        if thread and not glob.glob(os.path.join(home, "sessions/*/*/*", f"rollout-*{thread}.jsonl")):
+            return ""
+        text = event.get("last_assistant_message") or event.get("last-assistant-message") or ""
+        request("turn_end", id=report_id, text=text[:MAX_REPORT])
+    except (RuntimeError, ValueError, AttributeError):
+        pass
+    return ""
 
 
 def kill_agent(name: str) -> str:
@@ -1381,24 +1916,26 @@ def main():
         return
     import argparse
 
-    parser = argparse.ArgumentParser(description="Drive real agent terminals. Foot windows; no MCP or tmux.",
+    parser = argparse.ArgumentParser(description="Drive real agent terminals. Visible windows; no MCP or tmux.",
         epilog="Example: agent-hub spawn claude helper 'Reply READY' --cwd ~/Projects")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("spawn", help="start a visible interactive agent")
-    p.add_argument("kind", choices=INTERACTIVE)
+    p.add_argument("kind", metavar="PROFILE", help="profile name; see agent-hub profiles")
     p.add_argument("name")
     p.add_argument("prompt", nargs="?", default="")
     p.add_argument("--cwd", required=True, help="existing project directory; never inferred from the caller")
     p.add_argument("--model", default="")
     p.add_argument("--effort", default="")
     p.add_argument("--no-window", action="store_true", help="keep the PTY; attach later")
-    for command, help_text in (("read", "read a short screen"), ("wait", "wait for quiet; inspect dialogs/errors too"),
+    p.add_argument("--terminal", choices=["auto", *TERMINALS], default="", help="override AGENT_HUB_TERMINAL or automatic selection")
+    p.add_argument("--keep", action="store_true", help="stay open after done or when idle, for follow-ups; you must kill it")
+    for command, help_text in (("read", "read a short screen"), ("wait", "wait for a report or quiet; no name means any helper"),
                                ("ask", "send a prompt and wait"), ("send", "send a prompt"),
                                ("keys", "send keys: Enter, Escape, C-c, ..."),
                                ("model", "change model/effort"), ("attach", "attach here; Ctrl-] detaches"),
                                ("kill", "stop a session and its children")):
         p = sub.add_parser(command, help=help_text)
-        p.add_argument("name")
+        p.add_argument("name", nargs="?" if command == "wait" else None)
         if command in ("ask", "send"):
             p.add_argument("text")
         if command == "keys":
@@ -1412,20 +1949,46 @@ def main():
         if command == "model":
             p.add_argument("model", nargs="?", default="")
             p.add_argument("--effort", default="")
+    for command, help_text in (("tell", "helpers: send a message to your spawner"),
+                               ("done", "helpers: deliver your result and close")):
+        p = sub.add_parser(command, help=help_text)
+        p.add_argument("id")
+        p.add_argument("text", nargs="?" if command == "done" else None, default="")
+    p = sub.add_parser("turn-end")  # called by helper hooks, not by hand
+    p.add_argument("id")
+    p.add_argument("payload", nargs="?", default="")
+    p = sub.add_parser("resume", help="reopen a closed helper with its conversation")
+    p.add_argument("name")
+    p.add_argument("prompt", nargs="?", default="")
+    p.add_argument("--model", default="")
+    p.add_argument("--effort", default="")
+    p.add_argument("--no-window", action="store_true", help="keep the PTY; attach later")
+    p.add_argument("--keep", action="store_true", help="stay open after done or when idle, for follow-ups; you must kill it")
     p = sub.add_parser("models", help="list available models")
-    p.add_argument("kind", choices=INTERACTIVE)
-    sub.add_parser("ls", help="list sessions (does not start a daemon)")
+    p.add_argument("kind", metavar="PROFILE", help="profile name; see agent-hub profiles")
+    sub.add_parser("profiles", help="list built-in and configured account profiles")
+    p = sub.add_parser("ls", help="list sessions (does not start a daemon)")
+    p.add_argument("--closed", action="store_true", help="list closed helpers you can resume")
     a = parser.parse_args()
-    OWNER = caller_owner() if a.command != "daemon" else None
+    OWNER = caller_owner() if a.command not in ("daemon", "tell", "done", "turn-end") else None
     if a.command == "daemon":
         run_daemon()
         return
     if a.command == "spawn":
-        result = spawn_agent(a.kind, a.name, a.cwd, a.prompt, a.model, a.effort, visible=not a.no_window)
+        result = spawn_agent(a.kind, a.name, a.cwd, a.prompt, a.model, a.effort,
+                             visible=not a.no_window, terminal=a.terminal)
+    elif a.command == "resume":
+        result = resume_agent(a.name, a.prompt, a.model, a.effort, visible=not a.no_window, keep=a.keep)
+    elif a.command == "turn-end":
+        result = turn_end(a.id, a.payload)
+    elif a.command in ("tell", "done"):
+        result = report(a.id, a.text, done=a.command == "done")
     elif a.command == "models":
         result = available_models(a.kind)
+    elif a.command == "profiles":
+        result = list_profiles()
     elif a.command == "ls":
-        result = list_agents() if os.path.exists(SOCK) else "no agents"
+        result = list_closed() if a.closed else list_agents() if os.path.exists(SOCK) else "no agents"
     else:
         if a.command == "attach":
             run_attach(a.name)

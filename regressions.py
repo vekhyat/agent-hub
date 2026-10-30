@@ -67,9 +67,11 @@ class ProcessChecks(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(hub.archived(s.name,'agent-b'))
 
     async def test_visible_spawn_failure_stops_its_new_session(self):
+        # Without Hyprland, so the viewer launch fails rather than workspace placement.
+        env={k:v for k,v in os.environ.items() if k!='HYPRLAND_INSTANCE_SIGNATURE'}
         req={'op':'spawn','kind':'claude','name':'bad-viewer','argv':[sys.executable,'-c',"import time;print('READY',flush=True);time.sleep(60)"],
-             'cwd':self.tmp.name,'env':dict(os.environ),'owner':'agent-a','depth':0,'visible':True}
-        with patch.object(hub,'TERMINAL',['/usr/bin/false']):
+             'cwd':self.tmp.name,'env':env,'owner':'agent-a','depth':0,'visible':True,'terminal':'foot'}
+        with patch.dict(hub.TERMINALS,foot=['/usr/bin/false']),patch.dict(os.environ,AGENT_HUB_TERMINAL='foot'):
             try:
                 with self.assertRaisesRegex((RuntimeError,OSError),'terminal|viewer|Foot'):
                     await hub.dispatch(req)
@@ -77,6 +79,16 @@ class ProcessChecks(unittest.IsolatedAsyncioTestCase):
                 if 'bad-viewer' in hub.SESSIONS:
                     self.children.append(hub.SESSIONS['bad-viewer'])
         self.assertNotIn('bad-viewer',hub.SESSIONS)
+
+    async def test_unknown_or_invalid_workspace_never_starts_an_agent(self):
+        req = {'op': 'spawn', 'kind': 'claude', 'name': 'missing-origin', 'argv': ['claude'],
+               'cwd': self.tmp.name, 'env': {'HYPRLAND_INSTANCE_SIGNATURE': 'test'},
+               'owner': 'agent-a', 'visible': True}
+        with patch.object(hub, 'Session') as session, patch.object(hub, 'terminal_command', return_value=['/bin/foot']):
+            for workspace, error in [('', RuntimeError), ('invalid', ValueError)]:
+                with self.subTest(workspace=workspace), self.assertRaises(error):
+                    await hub.dispatch(dict(req, workspace=workspace))
+            session.assert_not_called()
 
 
 class OwnerChecks(unittest.TestCase):
@@ -136,9 +148,9 @@ class ConfigChecks(unittest.TestCase):
 
     def test_launch_model_merges_existing_overlay(self):
         captured=[]
-        def request(op,**kwargs):captured.append(kwargs);return {'name':kwargs.get('name','test')}
+        def request(op,**kwargs):captured.append(kwargs);return {'name':kwargs.get('name','test'),'profile':kwargs.get('profile')}
         for kind,key,value in [('grok','GROK_CONFIG',{'models':{'other':'keep'},'unrelated':'keep'}),('opencode','OPENCODE_CONFIG_CONTENT',{'permission':{'bash':'deny'}})]:
-            with self.subTest(kind=kind),patch.dict(os.environ,{key:json.dumps(value)}),patch.object(hub,'request',request),patch.object(hub,'wait_ready',return_value='READY'),patch.object(hub.shutil,'which',return_value='/usr/bin/true'):
+            with self.subTest(kind=kind),tempfile.TemporaryDirectory() as records,patch.object(hub,'HELPER_RECORDS',records),patch.dict(os.environ,{key:json.dumps(value)}),patch.object(hub,'request',request),patch.object(hub,'wait_ready',return_value='READY'),patch.object(hub.shutil,'which',return_value='/usr/bin/true'):
                 hub.spawn_agent(kind,'test',cwd='/tmp',model='new',visible=False)
                 config=json.loads(captured[-1]['env'][key])
                 for field,expected in value.items():

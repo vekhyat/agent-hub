@@ -1,0 +1,18 @@
+# Merge the entries you need into your own agent-hub/profiles.toml.
+# Each home is a native CLI configuration directory, not a project directory.
+
+[profiles.claude-work]
+kind = "claude"
+home = "~/.claude-work"
+
+[profiles.claude-personal]
+kind = "claude"
+home = "~/.claude-personal"
+
+[profiles.codex-work]
+kind = "codex"
+home = "~/.codex-work"
+
+[profiles.codex-personal]
+kind = "codex"
+home = "~/.codex-personal"

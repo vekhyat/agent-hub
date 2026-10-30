@@ -14,27 +14,19 @@ import agent_hub as hub
 class PackagingChecks(unittest.TestCase):
     def homes(self, values):
         env = {k: v for k, v in os.environ.items()
-               if k not in {"AGENT_HUB_CODEX1_HOME", "AGENT_HUB_CODEX2_HOME"}}
+               if k not in {"CODEX_HOME", "AGENT_HUB_CODEX1_HOME", "AGENT_HUB_CODEX2_HOME"}}
         env.update(values)
         result = subprocess.run(
             [sys.executable, "-c", "import json,agent_hub;print(json.dumps(agent_hub.CODEX_HOMES))"],
             env=env, text=True, capture_output=True, check=True)
         return json.loads(result.stdout)
 
-    def test_codex_account_defaults_are_portable(self):
-        self.assertEqual(self.homes({}), {
-            "codex1": str(Path.home() / ".codex"),
-            "codex2": str(Path.home() / ".codex2"),
-        })
+    def test_codex_home_default_is_portable(self):
+        self.assertEqual(self.homes({}), {"codex": str(Path.home() / ".codex")})
 
-    def test_both_codex_account_overrides_expand_home(self):
-        self.assertEqual(self.homes({
-            "AGENT_HUB_CODEX1_HOME": "~/first-account",
-            "AGENT_HUB_CODEX2_HOME": "~/second account",
-        }), {
-            "codex1": str(Path.home() / "first-account"),
-            "codex2": str(Path.home() / "second account"),
-        })
+    def test_codex_home_override_expands_home(self):
+        self.assertEqual(self.homes({"CODEX_HOME": "~/second account"}),
+                         {"codex": str(Path.home() / "second account")})
 
     def test_console_entry_has_concise_errors(self):
         with patch.object(hub, "main", side_effect=RuntimeError("test failure")):
@@ -48,7 +40,7 @@ class PackagingChecks(unittest.TestCase):
 
     def test_models_uses_each_accounts_cache(self):
         with tempfile.TemporaryDirectory() as temp:
-            for kind in ("codex1", "codex2"):
+            for kind in ("codex",):
                 home = Path(temp) / kind
                 home.mkdir()
                 (home / "models_cache.json").write_text(json.dumps({"models": [{

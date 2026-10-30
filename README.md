@@ -1,6 +1,6 @@
 # agent-hub
 
-Start coding agents in visible Foot terminals. Send prompts, read their screens,
+Start coding agents in visible terminal windows. Send prompts, read their screens,
 switch models, and close their processes from another agent or your terminal.
 
 ```sh
@@ -10,14 +10,33 @@ agent-hub read reviewer --lines 100
 agent-hub kill reviewer
 ```
 
-The launch profiles are `claude`, `codex1`, `codex2`, `opencode`, and `grok`.
-They use the agents' interactive interfaces and existing logins. Each helper
-receives its own PTY and a Foot window. There is no tmux session or MCP server.
+Use Claude, Codex, OpenCode, or Grok with your existing logins. Add named
+profiles for multiple Claude or Codex subscriptions, such as `claude-work` and
+`codex-personal`. Each helper receives its own PTY and terminal window.
+Supported terminals are Foot, Ghostty, Kitty, Alacritty, WezTerm, and xterm.
+There is no tmux session or MCP server.
+
+## Point your agent at it
+
+Paste this into the coding agent you already use:
+
+```text
+Read https://raw.githubusercontent.com/vekhyat/agent-hub/main/docs/agent-setup.md
+and set up agent-hub for my installed agents and accounts. Preserve my existing
+logins, launchers, and permission settings. Configure the accounts I choose,
+use an available terminal, and verify it in the project directory I specify.
+```
+
+The [agent setup guide](docs/agent-setup.md) covers installation, account
+profiles, terminal selection, and skill discovery. Browser sign-ins remain
+interactive. Your agent does not need to read or copy credential files.
 
 ## Install
 
-The supported environment is **Linux with Wayland, Foot, a systemd user manager,
-and delegated cgroup v2 with `cgroup.kill`**. Python 3.12 or newer is required.
+The supported environment is **Linux with a graphical session, a supported
+terminal, a systemd user manager, and delegated cgroup v2 with `cgroup.kill`**.
+Python 3.12 or newer is required. Foot needs Wayland. Other listed terminals
+can run under Wayland or X11, depending on their installed build.
 Install and sign in to whichever agent CLIs you want to launch. Other platforms
 are untested. The process cleanup fallback without systemd is best effort.
 
@@ -59,7 +78,7 @@ are untested. The process cleanup fallback without systemd is best effort.
    agent-hub spawn claude helper 'Reply READY' --cwd "$PWD"
    ```
 
-   A Foot window opens. The command returns the helper's screen, including any
+   A terminal window opens. The command returns the helper's screen, including any
    trust, sign-in, or permission dialog. Inspect that screen before continuing.
 
 2. Send work to the helper.
@@ -77,9 +96,70 @@ are untested. The process cleanup fallback without systemd is best effort.
    The daemon stops 10 seconds after the last helper finishes. Completed screens
    remain readable from the private runtime cache.
 
-For Codex, [set up the account launchers](docs/codex-accounts.md) first. The hub
-calls `codex1` and `codex2` explicitly. It does not substitute a generic `codex`
-command or create account credentials.
+For a default Codex installation, use `agent-hub spawn codex ...`. Existing
+`codex1` and `codex2` executable launchers also remain supported.
+
+## Use multiple accounts
+
+Define named profiles in `~/.config/agent-hub/profiles.toml`. Each profile selects
+an agent family and its account's configuration directory. Add as many profiles
+as you need. A minimal configuration looks like this:
+
+```toml
+[profiles.claude-work]
+kind = "claude"
+home = "~/.claude-work"
+
+[profiles.claude-personal]
+kind = "claude"
+home = "~/.claude-personal"
+
+[profiles.codex-work]
+kind = "codex"
+home = "~/.codex-work"
+
+[profiles.codex-personal]
+kind = "codex"
+home = "~/.codex-personal"
+```
+
+Sign in once through the native CLI for each chosen directory. Then run:
+
+```sh
+agent-hub profiles
+agent-hub spawn claude-work reviewer 'Review this project' --cwd "$PWD"
+agent-hub spawn codex-personal builder 'Summarize this project' --cwd "$PWD"
+```
+
+Claude profiles set `CLAUDE_CONFIG_DIR`. Codex profiles set `CODEX_HOME`.
+No wrapper scripts are required for these named profiles. Profiles can also
+use existing executable launchers with `command = "your-launcher"`.
+See [account setup and sign-in](docs/accounts.md) for the complete steps.
+
+## Choose a terminal
+
+The hub automatically selects the first installed terminal in this order:
+Foot, Ghostty, Kitty, Alacritty, WezTerm, then xterm. It skips Foot outside a
+Wayland session. Choose a terminal for one helper with `--terminal`:
+
+```sh
+agent-hub spawn claude reviewer 'Review this project' --cwd "$PWD" --terminal ghostty
+agent-hub spawn codex builder 'Summarize this project' --cwd "$PWD" --terminal kitty
+```
+
+Set `AGENT_HUB_TERMINAL=kitty` in your caller's environment to choose a default.
+`--terminal` takes precedence. `--no-window` keeps the interactive PTY and lets
+you attach later, without requiring a terminal emulator at spawn time.
+
+On Hyprland 0.56 or newer, helper windows open on the spawning agent's workspace
+without taking focus or switching your workspace. Nested helpers follow their
+parent's current terminal workspace, including after you move it. Detached callers
+with no identifiable window must set `AGENT_HUB_WORKSPACE=2` (or `name:project` /
+`special:agents`) or use `--no-window`. Other desktops retain their normal placement.
+
+Foot, Ghostty, and Alacritty have passed live window tests on the maintainer's
+Linux desktop. Kitty, WezTerm, and xterm use their native command-line adapters
+and have selection tests; their live windows have not been tested there yet.
 
 ## Let another agent use the CLI
 
@@ -93,15 +173,15 @@ ln -s "$PWD/skill" "$HOME/.codex/skills/agent-hub"
 ln -s "$PWD/skill" "$HOME/.claude/skills/agent-hub"
 ```
 
-For a second Codex account, place the same skill in that account's
-`CODEX_HOME/skills/agent-hub`. Other callers can use the CLI directly with
+For another Claude or Codex account, place the same skill in that account's
+configuration directory under `skills/agent-hub`. Other callers can use the CLI directly with
 `agent-hub --help`. Agent integrations must pass a distinct conversation ID on
 shared hosts. See [ownership and configuration](docs/reference.md).
 
 ## Resource use and limits
 
 The hub runs one shared daemon and one Python viewer per attached terminal.
-It loads `pyte` to keep a readable terminal screen. Agent processes and Foot
+It loads `pyte` to keep a readable terminal screen. Agents and terminal emulators
 consume their own resources. There is no permanently running background service
 when all helpers have finished. This tool does consume memory and CPU while active.
 
@@ -121,12 +201,12 @@ Create a development environment in the checkout:
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install .
-.venv/bin/python -m unittest -v verify regressions packaging_checks
+.venv/bin/python -m unittest -v verify regressions packaging_checks profile_checks terminal_checks
 ```
 
 These checks use dummy processes, temporary settings, and real PTYs. They make
 no model requests. Desktop integration checks also start temporary systemd user
-services and a Foot window:
+services and terminal windows for the supported emulators installed on the test machine:
 
 ```sh
 .venv/bin/python -m unittest -v integration
